@@ -1,7 +1,7 @@
 # ServerCore
 
 C++17 서버 토대 — **게임을 모르는** 네트워크·기반 계층입니다.
-[MMO_Zone](https://github.com/cocoz93/MMO) 에서 동접 ~5,000까지 병목을 추적하며 만든 코드를 떼어낸 것으로,
+[MMO_Zone](https://github.com/cocoz93/MMO_Zone) 에서 동접 ~5,000까지 병목을 추적하며 만든 코드를 떼어낸 것으로,
 다른 게임이 그대로 가져다 쓸 수 있게 두 계층으로 갈라 두었습니다.
 
 ```
@@ -85,7 +85,7 @@ cmake --build build --config Release
 
 ## 이력
 
-이 코드의 과거 커밋은 [MMO_Zone](https://github.com/cocoz93/MMO) 에 있습니다.
+이 코드의 과거 커밋은 [MMO_Zone](https://github.com/cocoz93/MMO_Zone) 에 있습니다.
 떼어낼 때 파일만 가져왔으므로 `git blame` 은 여기서 오늘부터 시작합니다.
 
 ## 라이선스
