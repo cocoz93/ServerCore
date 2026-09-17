@@ -1,0 +1,43 @@
+# ── 빌드 산출물 ──
+build/
+build-*/
+out/
+[Dd]ebug/
+[Rr]elease/
+x64/
+*.obj
+*.lib
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.iobj
+*.ipdb
+*.tlog
+*.log
+
+# ── CMake ──
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+CTestTestfile.cmake
+*.cmake.stamp*
+compile_commands.json
+
+# ── CMake 가 만들어내는 프로젝트 파일 (생성물이라 손대지 말 것) ──
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+.vs/
+*.suo
+
+# ── 에디터 ──
+.idea/
+.vscode/
+*.swp
+*~
+
+# ※ Base/ThirdParty/ 는 일부러 담는다 — spdlog·cpp-httplib 헤더온리 번들.
+#    제외하면 "클론하면 빌드가 안 된다"는 함정이 소비자마다 반복된다.
