@@ -7,12 +7,12 @@ C++17 서버 토대 — **게임을 모르는** 네트워크·기반 계층입�
 ```
 ServerBaseLib      링버퍼 · 직렬화 · 락프리 · 코어 친화도 · 로거
    ▲   ▲
-   │   └── MO_Belt          Linux epoll 벨트스크롤 — 헤더만 가져간다
+   │   └── MO_Belt — Linux epoll 벨트스크롤, 헤더만 가져간다
    │
 ServerNetworkLib   수용 · 세션 수명 · 전송 팔 (IOCP / RIO / epoll)
    ▲
-   ├── MMO_Zone            Windows IOCP MMO
-   └── 다음 게임            붙이면 그만
+   ├── MMO_Zone — Windows IOCP MMO
+   └── 다음 게임 — 붙이면 그만
 ```
 
 **왼쪽 위 둘이 이 저장소이고, 딸려 붙은 것이 가져다 쓰는 쪽입니다.** 화살표는 「딛는다」이고 **위로만 갑니다** —
