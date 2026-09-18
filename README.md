@@ -15,8 +15,9 @@ flowchart TD
     C -.-> N
     N --> S
     B --> S
-    classDef core fill:#eaf0ff,stroke:#5b7cc2,stroke-width:2px
-    classDef next fill:#fff,stroke:#aaa,stroke-dasharray:4 3,color:#666
+    %% 글자색을 반드시 같이 지정한다 — fill 만 주면 깃허브 다크 모드에서 글자가 배경에 묻힌다
+    classDef core fill:#eaf0ff,stroke:#5b7cc2,stroke-width:2px,color:#16233d
+    classDef next fill:#f6f6f6,stroke:#999,stroke-dasharray:4 3,color:#555
     class N,S core
     class C next
 ```
