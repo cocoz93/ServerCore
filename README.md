@@ -4,25 +4,18 @@ C++17 서버 토대 — **게임을 모르는** 네트워크·기반 계층입�
 [MMO_Zone](https://github.com/cocoz93/MMO_Zone) 에서 동접 ~5,000까지 병목을 추적하며 만든 코드를 떼어낸 것으로,
 다른 게임이 그대로 가져다 쓸 수 있게 두 계층으로 나눠 두었습니다.
 
-```mermaid
-flowchart BT
-    A["<b>MMO_Zone</b><br/>Windows IOCP MMO"]
-    C["<b>다음 게임</b><br/>붙이면 그만"]
-    B["<b>MO_Belt</b><br/>Linux epoll 벨트스크롤<br/>(헤더만)"]
-    N["<b>ServerNetworkLib</b><br/>수용 · 세션 수명<br/>전송 팔 (IOCP / RIO / epoll)"]
-    S["<b>ServerBaseLib</b><br/>링버퍼 · 직렬화 · 락프리<br/>코어 친화도 · 로거"]
-    A --> N
-    C -.-> N
-    N --> S
-    B --> S
-    %% 글자색을 반드시 같이 지정한다 — fill 만 주면 깃허브 다크 모드에서 글자가 배경에 묻힌다
-    classDef core fill:#eaf0ff,stroke:#5b7cc2,stroke-width:2px,color:#16233d
-    classDef next fill:#f6f6f6,stroke:#999,stroke-dasharray:4 3,color:#555
-    class N,S core
-    class C next
+```
+ServerBaseLib      링버퍼 · 직렬화 · 락프리 · 코어 친화도 · 로거
+   ▲   ▲
+   │   └── MO_Belt          Linux epoll 벨트스크롤 — 헤더만 가져간다
+   │
+ServerNetworkLib   수용 · 세션 수명 · 전송 팔 (IOCP / RIO / epoll)
+   ▲
+   ├── MMO_Zone            Windows IOCP MMO
+   └── 다음 게임            붙이면 그만
 ```
 
-**진한 두 칸이 이 저장소이고, 아래가 가져다 쓰는 쪽입니다.** 화살표는 「딛는다」이고 **위로만 갑니다** —
+**왼쪽 위 둘이 이 저장소이고, 딸려 붙은 것이 가져다 쓰는 쪽입니다.** 화살표는 「딛는다」이고 **위로만 갑니다** —
 반대 방향이 없는 건 규율이 아니라 빌드가 지킵니다. `ServerNetworkLib` 의 include 경로에
 소비자 디렉터리가 없어, 게임 헤더를 참조하면 그 자리에서 컴파일이 깨집니다.
 
