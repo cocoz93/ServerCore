@@ -110,5 +110,5 @@ cmake --build build --config Release
 
 ## 라이선스
 
-MIT — [LICENSE](LICENSE)
+© 2026 주우진 · 저작권 보유. 열람용으로 공개합니다.
 `Base/ThirdParty/` 의 spdlog · cpp-httplib 는 각자의 MIT 라이선스를 따릅니다.
