@@ -24,8 +24,7 @@ ServerNetworkLib   수용 · 세션 수명 · 전송 (IOCP / RIO / epoll)
 | 패킷 | 「앞 2바이트가 길이」 `Network/NetHeader.h` | `MsgType` 정의 `Protocol.h` |
 | 빌드 토글 | 전송·송신 경로 `Base/CoreConfig.h` | 게임 실험 토글 |
 
-쓰는 곳 셋 — [MMO_Zone](https://github.com/cocoz93/MMO_Zone)(Windows IOCP) ·
-[MO_Belt](https://github.com/cocoz93/MO_Belt)(Linux epoll) ·
+쓰는 곳 둘 — [MMO_Zone](https://github.com/cocoz93/MMO_Zone)(Windows IOCP) ·
 [TotalTest](https://github.com/cocoz93/TotalTest)(링버퍼 단위 테스트)
 
 ## 쓰는 법
