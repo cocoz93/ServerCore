@@ -90,13 +90,8 @@ public:
     Counter _recvBufferOverflow;             // RecvQ 오버플로 (수신 버퍼 가득 참)
     Counter _sendDiscardedBytes;             // Disconnect 시 SendQ 잔여 바이트 (체류량 보정용)
 
-    // ── DB 저장 파이프라인 (USE_DB_WORKER) — dirty flag 비동기 저장 ──
-    alignas(64) Counter _dbSavedJobs;    // UPSERT 성공 누적
-    Counter _dbFailedJobs;               // UPSERT 실패 누적
-    Counter _dbDroppedJobs;              // 백프레셔 드롭 누적 (슬롯 큐 상한 초과)
-    static constexpr int MAX_DB_WORKERS = 16;
-    Counter _dbQueueDepth[MAX_DB_WORKERS];               // 워커별 게이지: 마지막 배치 인출량
-    Counter _dbWorkerCount;                              // 노출 루프 상한 (CDBWorker::Start에서 설정)
+    // DB 저장 파이프라인 지표는 여기 없다 — 게임 프로젝트의 DB 워커가 세는 값이라 게임 쪽 그릇(MMO_Zone GameMonitor.h DBSaveCounters)에
+    //   있다(2026-10-06 옮김). 코어는 네트워크·세션·워커·게임 루프 공통 지표만 든다.
 
     // ══════════════════════════════════════════════════════════════
     // 게이지 (up/down)
@@ -119,11 +114,11 @@ public:
     //
     // 워커 스레드 카운터와 false sharing 방지를 위해 별도 struct로 격리
     // ══════════════════════════════════════════════════════════════
+    //   ★ 여기엔 어느 게임 루프에나 있는 값(단계 시간·이벤트 큐·브로드캐스트 호출/비용/분포)만 둔다.
+    //     게임 규칙 이름이 든 지표(존 이동·섹터 멤버십·이동 예산 등)는 게임 쪽 그릇에(2026-10-06 MMO_Zone 으로 옮김) —
+    //     코어를 쓰는 다른 프로젝트가 안 쓰는 필드를 지지 않게.
     struct alignas(64) GameLoopCounters
     {
-        Counter _zoneChangeCount;   // 존 이동 횟수
-        Counter _cheatDetected;     // 이동 검증 실패 (치트 감지) — 미구현, 향후 서버 권위 좌표 검증 시 사용 예정
-
         // 구간별 시간 (마이크로초 누적, counter)
         // Prometheus에서 rate(phase_sum) / rate(tick_count) → 틱당 평균 소비 시간
         Counter _phaseNetworkUs;        // ProcessNetworkEvents 소비 시간
@@ -138,28 +133,6 @@ public:
         // 평균 대상 수 = rate(targets) / rate(calls)
         Counter _broadcastCalls;        // 브로드캐스트 호출 횟수
         Counter _broadcastTargets;      // 브로드캐스트 대상 수 누적
-
-        // 멤버십 변경 복사량 — BroadcastAroundSector(gather/enqueue 계측 대상) 밖의 송신(복사) 횟수.
-        //   ProcessSectorChange·BroadcastEnterZone·BroadcastLeaveZone 전용인
-        //   SendCreateOtherPlayer/SendDeletePlayer 호출 수. _broadcastTargets(계측 대상 복사)와
-        //   비교해 비계측 복사의 비중을 가늠 → 정밀 측정(choke-point) 필요 여부 판단용.
-        Counter _membershipSends;
-
-        // 멤버십 변경 송신(복사) 시간 — ProcessSectorChange 구간 전용(섹터이동분).
-        //   game_logic 페이즈(_phaseGameLogicUs)에 섞여 있던 멤버십 복사를 분리 측정 → 묶음 최적화 ROI 판단용.
-        //   접속/퇴장(BroadcastEnter/LeaveZone)은 네트워크 페이즈라 1차 제외.
-        Counter _membershipCostUs;
-
-        // 같은 틱 이동자 쌍 보정 발동 횟수 — 틱 끝 일괄 통보가 놓친 CREATE/DELETE를 보충한 건수.
-        //   섹터 점유는 이동 즉시 갱신되는데 통보는 틱 끝에 "그 시점 주민"을 읽으므로,
-        //   같은 틱에 상대도 움직였으면 서로의 조회에서 빠진다(유령/투명인간). 그 보충분 집계.
-        //   0에 수렴하면 보정이 불필요한 부하, 지속 증가면 정상(이동자 밀집도에 비례).
-        Counter _membershipPairFixes;
-
-        // C2S_MOVE_START 좌표 수용을 이동량 예산 초과로 거부한 횟수.
-        //   정상 클라는 예산이 늘 만충이라 0에 머무는 것이 정상 — 0이 아니면 치트 시도이거나
-        //   예산 계수(MOVE_BUDGET_SLACK)가 빡빡하다는 신호.
-        Counter _moveBudgetRejects;
 
         // 비용종류별 계측 (counter, 마이크로초 누적) — 1단계: BroadcastAroundSector hot path 전용
         //
