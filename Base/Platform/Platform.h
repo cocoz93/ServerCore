@@ -318,6 +318,7 @@ namespace Platform
         inline void (*g_shutdownCb)() = nullptr;
         inline const std::atomic<bool>* g_shutdownComplete = nullptr;   // 정리 완료 신호 (nullptr=대기 안 함)
         inline uint32_t g_shutdownWaitMaxMs = 0;
+        inline void (*g_waitTimeoutCb)() = nullptr;   // 기다림이 상한에 닿아 정리 완료 없이 반환하기 직전 1회 (nullptr=안 부름)
 #ifdef _WIN32
         inline BOOL WINAPI ConsoleCtrlProxy(DWORD ctrlType)
         {
@@ -343,7 +344,11 @@ namespace Platform
                     while (!g_shutdownComplete->load(std::memory_order_acquire))
                     {
                         if (GetTickCount64() >= deadline)
+                        {
+                            // 정리를 못 끝낸 채 반환한다 — 부르는 쪽이 「무엇을 잃는지」를 남길 마지막 자리(이 층은 로그를 모른다)
+                            if (g_waitTimeoutCb) g_waitTimeoutCb();
                             break;
+                        }
                         Sleep(20);
                     }
                 }
@@ -362,13 +367,17 @@ namespace Platform
     // completeFlag/waitMaxMs — 창 닫기·로그오프처럼 "핸들러가 반환하면 OS가 즉시 죽이는" 경로에서
     //   정리 완료를 기다릴 대상과 상한(ms). Windows 전용이며 nullptr이면 대기하지 않는다.
     //   Linux는 SIGINT/SIGTERM이 와도 프로세스가 바로 죽지 않아(main이 스스로 빠져나온다) 대기가 불필요.
+    // onWaitTimeout — 그 기다림이 상한에 닿아 정리 완료 없이 반환하기 직전에 1회(Windows 전용 · nullptr이면 안 부름).
+    //   반환하는 순간 OS가 죽이므로, 남길 것(로그)은 이 안에서 실제로 내보내기까지 끝내야 한다. 남은 유예는 OS 유예 − waitMaxMs.
     inline void InstallShutdownHandler(void (*cb)(),
                                        const std::atomic<bool>* completeFlag = nullptr,
-                                       uint32_t waitMaxMs = 0)
+                                       uint32_t waitMaxMs = 0,
+                                       void (*onWaitTimeout)() = nullptr)
     {
         detail::g_shutdownCb = cb;
         detail::g_shutdownComplete = completeFlag;
         detail::g_shutdownWaitMaxMs = waitMaxMs;
+        detail::g_waitTimeoutCb = onWaitTimeout;
 #ifdef _WIN32
         SetConsoleCtrlHandler(detail::ConsoleCtrlProxy, TRUE);
 #else
