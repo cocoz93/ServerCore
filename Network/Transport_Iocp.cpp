@@ -176,8 +176,8 @@ void CIOCPServer::TransportSendImmediate(CSession* session, int64_t sessionId)
     PostSend(session);
 }
 
-// 틱 끝 dirty 배치 → 송신 (게임 스레드 단독 호출)
-void CIOCPServer::TransportFlushDirty()
+// 틱 끝 dirty 배치 → 송신 (묶음을 가진 스레드가 호출)
+void CIOCPServer::TransportFlushDirty(CSendBatch& batch)
 {
 #if USE_SEND_THREAD
     // dirty 배치(sessionId)를 uniqueId%K 워커에 핸드오프. 게임루프는 WSASend(PostSend)를 하지 않는다.
@@ -190,9 +190,9 @@ void CIOCPServer::TransportFlushDirty()
         for (auto& v : perWorker)
             v.clear();
 
-    for (CSession* session : _dirtySessions)
+    for (CSession* session : batch._sessions)
     {
-        session->_sendDirty = false;                   // 게임 스레드 단독 접근 → 안전
+        session->_sendDirty.store(false, std::memory_order_relaxed);   // 묶음 주인 스레드 (겹칠 때는 IOCPServer.h 참고)
         // 틱을 넘는 중복 방지(_queuedForSend): 이미 큐에 있으면(미처리) 다시 넣지 않는다.
         //   발산 시 같은 세션이 매 틱 쌓여 큐가 무한 증가하는 것을 막음(처리량 천장은 별개).
         if (InterlockedExchange(&session->_queuedForSend, TRUE) == FALSE)
@@ -206,7 +206,7 @@ void CIOCPServer::TransportFlushDirty()
             perWorker[CSession::ExtractUniqueId(sessionId) % _sendWorkerCount].push_back(sessionId);  // raw ptr 아닌 id
         }
     }
-    _dirtySessions.clear();
+    batch._sessions.clear();
 
     for (int i = 0; i < _sendWorkerCount; ++i)
     {
@@ -220,12 +220,12 @@ void CIOCPServer::TransportFlushDirty()
         worker.cv.notify_one();
     }
 #elif USE_SEND_COALESCING
-    for (CSession* session : _dirtySessions)
+    for (CSession* session : batch._sessions)
     {
-        session->_sendDirty = false;
+        session->_sendDirty.store(false, std::memory_order_relaxed);
         PostSend(session);
     }
-    _dirtySessions.clear();
+    batch._sessions.clear();
 #endif
 }
 

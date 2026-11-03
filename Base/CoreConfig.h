@@ -39,7 +39,7 @@
 //         _flushQueue 백로그를 함께 봐야 천장 이동 지점이 보임.
 #define USE_SEND_THREAD 1
 
-//   의존: USE_SEND_COALESCING=1 필요 (_dirtySessions 배치를 재사용). =0이면 dirty 배치가
+//   의존: USE_SEND_COALESCING=1 필요 (CSendBatch 배치를 재사용). =0이면 dirty 배치가
 //         안 쌓여 무의미하므로 함께 켤 것.
 #if USE_SEND_THREAD && !USE_SEND_COALESCING
 	#error "USE_SEND_THREAD requires USE_SEND_COALESCING=1 (dirty 배치 핸드오프 의존)"

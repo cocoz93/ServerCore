@@ -41,8 +41,9 @@ void CSession::Initialize(SOCKET socket, int64_t sessionId)
     _disconnecting = FALSE;
     _sendSubmitBusy = FALSE;
     _sendInFlight = 0;
-    _sendDirty = false;
+    _sendDirty.store(false, std::memory_order_relaxed);
     _queuedForSend = FALSE;
+    _recvEventQueue.store(nullptr, std::memory_order_release);
     _recvQ.Clear();
 #if USE_LOCKFREE_SENDQ
     // 방어코드 : 정상 흐름에서는 ReleaseSession에서 SendQ 비움
@@ -648,9 +649,12 @@ void CIOCPServer::ParsePackets(CSession* session)
             EchoTestSend(session, pMsg);
             break;
         case ServerMode::GameServer:
+        {
+            ThreadSafeQueue<NetworkEvent>* target = session->_recvEventQueue.load(std::memory_order_acquire);
             PushNetworkEvent(NetworkEvent(NetworkEvent::Type::RECEIVED,
-                session->_sessionId, pMsg));
+                session->_sessionId, pMsg), target ? *target : _eventQueue);
             break;
+        }
         default:
             // 알 수 없는 모드 — 어느 경로로도 소비되지 않으므로 소유권 회수 (누수 방어)
             pMsg->SubRef();
@@ -970,11 +974,11 @@ bool CIOCPServer::RequestSendMsg(int64_t sessionId, CSerialBuffer* pMsg, [[maybe
     {
         TransportSendImmediate(session, sessionId);
     }
-    else if (!session->_sendDirty)   // SendFlush::Deferred — 틱 끝 FlushPendingSends에서 묶어 송신
+    else if (!session->_sendDirty.load(std::memory_order_relaxed))   // SendFlush::Deferred — 틱 끝 FlushPendingSends에서 묶어 송신
     {
         // 이번 틱 첫 enqueue 세션만 dirty 등록(중복 방지)
-        session->_sendDirty = true;
-        _dirtySessions.push_back(session);
+        session->_sendDirty.store(true, std::memory_order_relaxed);
+        _defaultSendBatch._sessions.push_back(session);
     }
 #else
     PostSend(session);   // coalescing off: Deferred 요청도 즉시 송신 (flush 인자 무시)
@@ -988,6 +992,11 @@ bool CIOCPServer::RequestSendMsg(int64_t sessionId, CSerialBuffer* pMsg, [[maybe
 //   ② 항상 Deferred (틱 끝에서만 호출되는 전제 → 직후 FlushPendingSends가 묶어 송신)
 // 송신 메트릭(_sendPackets/_sendEnqueuedBytes)은 호출자가 집계 (RequestSendMsg와 동일 계약).
 bool CIOCPServer::RequestSendRaw(int64_t sessionId, const char* data, int size)
+{
+    return RequestSendRaw(_defaultSendBatch, sessionId, data, size);
+}
+
+bool CIOCPServer::RequestSendRaw(CSendBatch& batch, int64_t sessionId, const char* data, int size)
 {
     // ── Session ABA 검증 (3-step) — RequestSendMsg와 동일 ──
     auto session = FindSession(sessionId);
@@ -1010,12 +1019,13 @@ bool CIOCPServer::RequestSendRaw(int64_t sessionId, const char* data, int size)
     }
 
 #if USE_SEND_COALESCING
-    if (!session->_sendDirty)   // 틱 끝 FlushPendingSends에서 묶어 송신
+    if (!session->_sendDirty.load(std::memory_order_relaxed))   // 틱 끝 FlushPendingSends에서 묶어 송신
     {
-        session->_sendDirty = true;
-        _dirtySessions.push_back(session);
+        session->_sendDirty.store(true, std::memory_order_relaxed);
+        batch._sessions.push_back(session);
     }
 #else
+    (void)batch;
     PostSend(session);   // (도달 불가 — BuildConfig가 COALESCING=1을 강제하지만 방어적으로 유지)
 #endif
     IOCountDecrement(session);
@@ -1026,18 +1036,43 @@ bool CIOCPServer::RequestSendRaw(int64_t sessionId, const char* data, int size)
 // PostSend가 내부에서 AcquireSession/_disconnecting을 재검증하므로 dirty 등록 후 세션이 끊겨도 안전.
 void CIOCPServer::FlushPendingSends()
 {
-    TransportFlushDirty();
+    TransportFlushDirty(_defaultSendBatch);
+}
+
+void CIOCPServer::FlushPendingSends(CSendBatch& batch)
+{
+    TransportFlushDirty(batch);
+}
+
+bool CIOCPServer::SetSessionRecvQueue(int64_t sessionId, ThreadSafeQueue<NetworkEvent>* queue)
+{
+    // ── Session ABA 검증 (3-step) — RequestSendMsg와 동일 ──
+    auto session = FindSession(sessionId);
+    if (!session) return false;
+
+    if (!AcquireSession(session)) return false;
+
+    if (session->_sessionId != sessionId) { IOCountDecrement(session); return false; }
+
+    session->_recvEventQueue.store(queue, std::memory_order_release);
+    IOCountDecrement(session);
+    return true;
 }
 
 
 // ParsePackets 쪽에서 호출
 void CIOCPServer::PushNetworkEvent(NetworkEvent&& event)
 {
+    PushNetworkEvent(std::move(event), _eventQueue);
+}
+
+void CIOCPServer::PushNetworkEvent(NetworkEvent&& event, ThreadSafeQueue<NetworkEvent>& queue)
+{
     // enqueue 시각 스탬프 (게임루프에서 handle-latency = 처리완료시각 - 이 값 으로 계산)
     // steady_clock은 프로세스 전역 단조 → 워커 push / 게임루프 pop 간 비교 안전
     event.enqueueTimeNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
-    _eventQueue.Push(std::move(event));
+    queue.Push(std::move(event));
 }
 
 // GameLogicThread 쪽에서 호출

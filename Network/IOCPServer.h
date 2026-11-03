@@ -50,6 +50,10 @@ enum class IOOperation
 
 
 
+// 세션이 자기 수신 큐를 가리키려고 먼저 선언한다 (정의는 아래)
+struct NetworkEvent;
+template<typename T> class ThreadSafeQueue;
+
 class CSession
 {
 public:
@@ -110,11 +114,16 @@ public:
 
     // 게임 스레드가 만지는 송신 표식 묶음 — 위쪽 송신 게이트(완료 워커 고빈도 갱신)와
     // 캐시라인 분리하여 false sharing 방지. (_queuedForSend는 송신 스레드도 clear)
-    alignas(64) bool _sendDirty = false;   // [coalescing] 틱 내 송신 대기 표식 (게임 스레드 전용, Initialize에서 리셋)
+    // _sendDirty는 묶음(CSendBatch)을 가진 스레드만 만지지만, 접속이 끊겨 자리가 다시 쓰이면 옛 묶음의 스레드와
+    // 새 주인 스레드가 잠깐 겹칠 수 있어 atomic으로 둔다. 어느 순서로 겹쳐도 묶음에 중복으로 들어갈 뿐 송신이 빠지지는 않는다.
+    alignas(64) std::atomic<bool> _sendDirty{ false };   // [coalescing] 틱 내 송신 대기 표식 (Initialize에서 리셋)
     volatile LONG _queuedForSend = FALSE;  // [send-worker] 워커 queue 잔류 표식 — 틱을 넘는 중복 push 방지.
                                            // 게임 스레드(push 시 set)·송신 스레드(처리 전 clear) 공유 → Interlocked 필수.
 
     CRingBufferST _recvQ; // 한 스레드에서만 접근
+
+    // 받은 패킷을 넣을 큐. nullptr이면 서버 공용 큐(_eventQueue). SetSessionRecvQueue로 정하고 Initialize에서 리셋.
+    std::atomic<ThreadSafeQueue<NetworkEvent>*> _recvEventQueue{ nullptr };
 
 #if USE_LOCKFREE_SENDQ
     LockFree::CLockFreeQueue<CSerialBuffer*, false, true> _sendQ;
@@ -311,6 +320,15 @@ private:
 //   Deferred  : 묶어 보내도 되는 게임루프 송신 → 틱 끝 FlushPendingSends에서 일괄
 enum class SendFlush { Immediate, Deferred };
 
+// 틱 동안 송신이 쌓인 세션 목록 — 스레드 하나가 소유한다(잠금 없음).
+//   게임 스레드가 여럿이면 스레드마다 하나씩 둔다. 세션 하나에 보내는 스레드는 하나여야 한다(송신 링의 생산자가 하나라는 계약).
+//   게임 스레드가 하나면 이 타입을 몰라도 된다 — 묶음 인자가 없는 RequestSendRaw·FlushPendingSends가 내부 묶음을 쓴다.
+class CSendBatch
+{
+    friend class CIOCPServer;
+    std::vector<CSession*> _sessions;
+};
+
 // IOCP 기반 네트워크 서버
 class CIOCPServer
 {
@@ -338,10 +356,24 @@ public:
     // 안 쓰는 빌드에서는 호출자가 없어 그냥 안 불릴 뿐이다.
     bool RequestSendRaw(int64_t sessionId, const char* data, int size);
 
+    // 게임 스레드가 여럿일 때 — 부르는 스레드 자기 묶음에 쌓는다. 틱 끝에 같은 묶음으로 FlushPendingSends를 부를 것.
+    bool RequestSendRaw(CSendBatch& batch, int64_t sessionId, const char* data, int size);
+
     bool RequestDisconnectSession(int64_t sessionId);
 
     // [coalescing] 게임 루프가 틱 끝에 1회 호출 — 이번 틱에 enqueue된 세션을 한 번에 flush (게임 스레드 단독)
     void FlushPendingSends();
+
+    // 게임 스레드가 여럿일 때 — 묶음을 가진 스레드가 틱 끝에 1회 호출
+    void FlushPendingSends(CSendBatch& batch);
+
+    // 이 세션이 받은 패킷을 공용 큐 대신 queue로 넣는다 (nullptr이면 공용 큐로 되돌림). 아무 스레드나 불러도 된다.
+    //   방이 스레드에 고정된 서버용 — 입력이 공용 큐를 소비하는 스레드를 거치지 않고 워커에서 그 스레드로 바로 간다.
+    //   접속·끊김 이벤트는 그대로 공용 큐로 간다. 한 세션의 받은 패킷은 끊김 이벤트보다 먼저 큐에 들어간다.
+    //   queue는 ShutdownServer가 끝날 때까지 살아 있어야 한다. 남은 패킷의 pMsg->SubRef()는 소비하는 쪽 몫이다.
+    //   이 큐의 길이는 신규 accept 거절 임계(SetEventQueueAcceptLimit)에 들어가지 않는다.
+    // 반환: 세션이 이미 없으면 false
+    bool SetSessionRecvQueue(int64_t sessionId, ThreadSafeQueue<NetworkEvent>* queue);
 
     // 게임 로직 레이어로 전달할 이벤트 가져오기 (QUEUE_BASED 모드용)
     bool PopNetworkEvent(NetworkEvent& event);
@@ -370,6 +402,7 @@ private:
 
     // 게임 로직으로 이벤트 전달 (QUEUE_BASED 모드용)
     void PushNetworkEvent(NetworkEvent&& event);
+    void PushNetworkEvent(NetworkEvent&& event, ThreadSafeQueue<NetworkEvent>& queue);
 
     void AcceptThread();
 #if !USE_RIO_TRANSPORT
@@ -439,7 +472,7 @@ private:
     bool  TransportAttachSession(CSession* session, Platform::NetSocket clientSocket);   // 완료 통지 연결 (IOCP: BindIOCP)
     void  TransportStartFirstRecv(CSession* session, Platform::NetSocket clientSocket, int64_t sessionId);  // 첫 Recv 착수
     void  TransportSendImmediate(CSession* session, int64_t sessionId);     // SendFlush::Immediate 경로
-    void  TransportFlushDirty();                           // 틱 끝 dirty 배치 → 송신 (팔별 핸드오프)
+    void  TransportFlushDirty(CSendBatch& batch);          // 틱 끝 dirty 배치 → 송신 (팔별 핸드오프)
     bool  TransportRequestDisconnect(CSession* session);    // 종료 유도 (IOCP: CancelIoEx / RIO: 소유 워커 close)
 
     void ParsePackets(CSession* session);
@@ -487,8 +520,8 @@ private:
     std::vector<std::unique_ptr<CSession>> _sessions;  // Index 기반 접근가능
     LockFree::CLockFreeStack<uint16_t> _availableIndices;  // 재사용 가능한 인덱스 스택
 
-    // [coalescing] 틱 내 송신 대기 세션 목록 (게임 스레드 단독 접근 → 무락)
-    std::vector<CSession*> _dirtySessions;
+    // [coalescing] 묶음 인자가 없는 송신 함수가 쓰는 틱 내 송신 대기 세션 목록 (게임 스레드 단독 접근 → 무락)
+    CSendBatch _defaultSendBatch;
 
 #if USE_SEND_THREAD && !USE_RIO_TRANSPORT
     // 송신 워커 풀 — 게임루프가 dirty 배치(sessionId)를 uniqueId%K 워커에 넘기고 각 워커가 WSASend.

@@ -241,8 +241,8 @@ void CIOCPServer::TransportSendImmediate(CSession* session, int64_t sessionId)
     }
 }
 
-// 틱 끝 dirty 배치 → 소유 워커별 FlushSend 명령 핸드오프 (게임 스레드 단독 호출)
-void CIOCPServer::TransportFlushDirty()
+// 틱 끝 dirty 배치 → 소유 워커별 FlushSend 명령 핸드오프 (묶음을 가진 스레드가 호출)
+void CIOCPServer::TransportFlushDirty(CSendBatch& batch)
 {
     // dirty 배치를 소유 워커별 FlushSend 명령으로 핸드오프 — 분배(uniqueId%N)·잔류표식(_queuedForSend)
     // dedup 로직은 기존 SendWorker 경로 그대로. 워커별 1회 락 + 1회 SetEvent.
@@ -253,9 +253,9 @@ void CIOCPServer::TransportFlushDirty()
         for (auto& v : perWorker)
             v.clear();
 
-    for (CSession* session : _dirtySessions)
+    for (CSession* session : batch._sessions)
     {
-        session->_sendDirty = false;                   // 게임 스레드 단독 접근 → 안전
+        session->_sendDirty.store(false, std::memory_order_relaxed);   // 묶음 주인 스레드 (겹칠 때는 IOCPServer.h 참고)
         if (InterlockedExchange(&session->_queuedForSend, TRUE) == FALSE)
         {
             // sessionId는 exchange "후"에 읽는다 — 읽기~exchange 사이 slot 재사용 시 옛 id를
@@ -265,7 +265,7 @@ void CIOCPServer::TransportFlushDirty()
             perWorker[RioOwnerIndex(sessionId)].push_back(sessionId);
         }
     }
-    _dirtySessions.clear();
+    batch._sessions.clear();
 
     for (int i = 0; i < _rioWorkerCount; ++i)
     {

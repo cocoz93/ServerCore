@@ -326,17 +326,17 @@ void CIOCPServer::TransportSendImmediate(CSession* session, int64_t sessionId)
     EpollSendSession(session);
 }
 
-// 틱 끝 dirty 배치 → 송신 (게임 스레드 단독 호출)
+// 틱 끝 dirty 배치 → 송신 (묶음을 가진 스레드가 호출)
 //   [코얼레싱] 틱 동안 쌓인 것을 세션당 한 번의 writev로 내보낸다. 이 묶음이 syscall 수를
 //   결정하므로, 모델이 IOCP든 epoll이든 유지할 가치가 있는 구조다.
-void CIOCPServer::TransportFlushDirty()
+void CIOCPServer::TransportFlushDirty(CSendBatch& batch)
 {
-    for (CSession* session : _dirtySessions)
+    for (CSession* session : batch._sessions)
     {
-        session->_sendDirty = false;                // 게임 스레드 단독 접근
+        session->_sendDirty.store(false, std::memory_order_relaxed);   // 묶음 주인 스레드 (겹칠 때는 IOCPServer.h 참고)
         EpollSendSession(session);
     }
-    _dirtySessions.clear();
+    batch._sessions.clear();
 }
 
 // 종료 유도 — IOCP는 CancelIoEx로 걸린 I/O를 취소했지만, epoll에는 취소할 "걸린 I/O"가 없다.

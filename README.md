@@ -41,6 +41,13 @@ target_link_libraries(내게임 PRIVATE ServerNetworkLib)   # Base 는 따라온
 enum class MsgType : uint16_t { /* 게임이 정한다 */ };
 ```
 
+## 게임 스레드가 여럿일 때
+
+방을 스레드에 고정 배정하는 서버처럼, 세션 하나를 한 스레드만 만지는 구조에서 씁니다. 게임 스레드가 하나면 몰라도 됩니다.
+
+- **송신** — 스레드마다 `CSendBatch` 를 두고 `RequestSendRaw(batch, …)` 로 쌓은 뒤 틱 끝에 `FlushPendingSends(batch)`
+- **수신** — `SetSessionRecvQueue(세션, 큐)` 로 정하면 받은 패킷이 공용 큐를 거치지 않고 워커에서 그 큐로 바로 갑니다. 접속·끊김 이벤트는 공용 큐 그대로입니다
+
 ## 고칠 때
 
 **이 저장소가 정본입니다.** 가져다 쓰는 쪽에서 고치면 그 PC 에만 남습니다
