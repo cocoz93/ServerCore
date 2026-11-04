@@ -11,6 +11,7 @@
 #include "Platform/Platform.h"   // 소켓 핸들 타입·소켓 API 경계 (리눅스는 소켓 헤더까지)
 #include <vector>
 #include <memory>
+#include <string>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -73,7 +74,7 @@ public:
     explicit CSession();
     virtual ~CSession();
 
-    void Initialize(SOCKET socket, int64_t sessionId);
+    void Initialize(SOCKET socket, int64_t sessionId, int tag = 0);
     void Close();
 
 
@@ -103,6 +104,7 @@ public:
     volatile LONG _disconnecting;   // 종료 진행 플래그. InterlockedExchange로 1회만 설정
     volatile SOCKET _socket;
     volatile int64_t _sessionId;    // Initialize에서 설정, IOCount>0 동안 유효
+    int _tag = 0;                   // 구분 값 — 어느 포트로 온 연결인가. 0 = 생성자 포트. Initialize에서 정하고 세션이 끝날 때까지 안 바뀐다
     // [다중 pending 송신] 1-pending 시절의 _sending 하나를 두 역할로 나눈 것 —
     //   _sendSubmitBusy : 제출 구간만 잠근다(세그먼트 계산~제출 호출). 제출자가 둘인 IOCP 팔
     //                     (송신 워커 + 완료 워커의 이어보내기)에서 제출 순서=와이어 순서를 지킨다.
@@ -248,20 +250,22 @@ struct NetworkEvent
     };
 
     Type type;
+    int tag;                     // 이 세션의 구분 값 — type 뒤 빈자리에 두어 구조체 크기가 그대로다
     int64_t sessionId;
     CSerialBuffer* pMsg;
     int64_t enqueueTimeNs = 0;   // PushNetworkEvent에서 스탬프 (handle-latency 측정용 steady_clock ns)
 
-    NetworkEvent(Type t, int64_t id)
-        : type(t), sessionId(id), pMsg(nullptr)
+    NetworkEvent(Type t, int64_t id, int sessionTag = 0)
+        : type(t), tag(sessionTag), sessionId(id), pMsg(nullptr)
     {
     }
 
-    NetworkEvent(Type t, int64_t id, CSerialBuffer* msg)
-        : type(t), sessionId(id), pMsg(msg)
+    NetworkEvent(Type t, int64_t id, CSerialBuffer* msg, int sessionTag = 0)
+        : type(t), tag(sessionTag), sessionId(id), pMsg(msg)
     {
     }
 };
+static_assert(sizeof(NetworkEvent) == 32, "NetworkEvent 크기가 바뀌었다 — 이벤트 큐 메모리 사용량이 같이 바뀐다");
 
 
 // 스레드 안전한 큐
@@ -338,6 +342,23 @@ public:
                         int rioWorkers = 0, int completionBatch = 0, int sendDepth = 1);
     virtual ~CIOCPServer();
 
+    // 포트를 더 연다. Start 전에 부른다. 포트마다 접속 받는 스레드가 하나 붙는다.
+    //   ip   = 접속을 기다릴 주소. 이 주소로 온 접속만 받는다 (생성자 포트는 지금처럼 모든 주소)
+    //   tag  = 이 포트로 온 세션의 구분 값. 이벤트마다 실려 나가므로 받는 쪽이 처리표를 고를 수 있다
+    // 반환: 주소가 틀렸거나 이미 Start했으면 false. bind·listen 실패는 Start가 false를 돌린다.
+    bool AddListener(const char* ip, int port, int tag);
+
+    // 다른 서버에 접속해, 받은 접속과 같은 경로로 세션에 등록한다. Start 뒤에 부른다.
+    //   연결되거나 실패할 때까지 막히므로 틱을 도는 스레드에서 부르지 말 것.
+    //   ShutdownServer 전에 이 함수를 부르는 스레드를 먼저 멈출 것 (종료 중 세션 표를 건드리지 않게).
+    // 반환: 세션 번호. 실패하면 0
+    int64_t ConnectTo(const char* ip, int port, int tag);
+
+    // 구분 값 0 세션의 상한 (0 = 끄기). Start 전에 설정할 것.
+    //   세션 표 크기는 생성자 값 그대로다 — 호출자가 생성자에 「정원 + 여유」를, 여기에 정원을 넘긴다.
+    //   표를 코어 안에서 몰래 키우지 않는 까닭: 호출자가 같은 세션 색인으로 자기 표를 만들기 때문이다.
+    void SetUntaggedSessionLimit(int limit) { _untaggedSessionLimit = (limit > 0) ? limit : 0; }
+
     bool Start();
     void ShutdownServer();
 
@@ -404,7 +425,7 @@ private:
     void PushNetworkEvent(NetworkEvent&& event);
     void PushNetworkEvent(NetworkEvent&& event, ThreadSafeQueue<NetworkEvent>& queue);
 
-    void AcceptThread();
+    void AcceptThread(SOCKET listenSocket, int tag);
 #if !USE_RIO_TRANSPORT
     void WorkerThread();
 
@@ -429,12 +450,15 @@ private:
 #endif
 
     bool CreateListenSocket();
+    SOCKET OpenListenSocket(uint32_t addrNetOrder, int port);   // 소켓 생성 + bind + listen. 실패하면 INVALID_SOCKET
+    bool CreateExtraListenSockets();                            // AddListener로 받은 포트 전부. 실패하면 false(연 것은 호출자가 닫음)
+    void CloseExtraListenSockets();
     bool SetSocketOptions(SOCKET socket);
 #if !USE_RIO_TRANSPORT
     bool BindIOCP(SOCKET socket, ULONG_PTR completionKey);
 #endif
 
-    void ProcessAccept(SOCKET clientSocket);
+    int64_t ProcessAccept(SOCKET clientSocket, int tag);   // 반환: 세션 번호. 거절하면 0
     void ProcessRecv(CSession* session, DWORD bytesTransferred);
     // slot = 이 완료가 쓴 in-flight 슬롯 (IOCP는 OverlappedEx.slot, RIO는 RequestContext에서 얻는다)
     void ProcessSend(CSession* session, DWORD bytesTransferred, int slot);
@@ -516,6 +540,18 @@ private:
 
     std::vector<std::thread> _workerThreads;
     std::thread _acceptThread;
+
+    // AddListener로 더 연 포트 — Start 뒤에는 목록이 안 바뀐다
+    struct ExtraListener
+    {
+        uint32_t    addrNetOrder = 0;   // 접속을 기다릴 주소 (네트워크 바이트 순서)
+        int         port = 0;
+        int         tag = 0;
+        SOCKET      socket = INVALID_SOCKET;
+        std::thread thread;
+    };
+    std::vector<ExtraListener> _extraListeners;
+    int _untaggedSessionLimit = 0;      // 구분 값 0 세션 상한 (0=끄기). 설정은 기동 전 1회, 이후 읽기 전용
 
     std::vector<std::unique_ptr<CSession>> _sessions;  // Index 기반 접근가능
     LockFree::CLockFreeStack<uint16_t> _availableIndices;  // 재사용 가능한 인덱스 스택

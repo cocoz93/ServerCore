@@ -96,7 +96,8 @@ public:
     // ══════════════════════════════════════════════════════════════
     // 게이지 (up/down)
     // ══════════════════════════════════════════════════════════════
-    alignas(64) Counter _sessionCount;    // 현재 동접 수
+    alignas(64) Counter _sessionCount;    // 현재 동접 수 (구분 값 0 세션만)
+    Counter _taggedSessionCount;          // 구분 값이 있는 세션 수 (서버 간 연결 등) — 동접 수에 안 넣고 따로 센다
     // 이벤트 큐 크기는 ThreadSafeQueue::GetSize()로 직접 조회
 
     // 완료 수거 방식 실효값 (INI CompletionBatch) — 0=GQCS 1건씩, N>0=GQCSEx 최대 N건.

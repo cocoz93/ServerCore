@@ -34,10 +34,11 @@ CSession::CSession()
 #endif
 }
 
-void CSession::Initialize(SOCKET socket, int64_t sessionId)
+void CSession::Initialize(SOCKET socket, int64_t sessionId, int tag)
 {
     _socket = socket;
     _sessionId = sessionId;
+    _tag = tag;
     _disconnecting = FALSE;
     _sendSubmitBusy = FALSE;
     _sendInFlight = 0;
@@ -221,10 +222,25 @@ bool CIOCPServer::Start()
         return false;
     }
 
+    // AddListener로 받은 포트 — 하나라도 못 열면 기동 실패로 친다.
+    //   반쪽만 열고 돌면 서버 간 접속이 조용히 안 되는 서버가 뜬다.
+    if (!CreateExtraListenSockets())
+    {
+        CloseExtraListenSockets();
+        Platform::CloseSocket(_listenSocket);
+        _listenSocket = INVALID_SOCKET;
+        TransportPreListenCleanup();
+        Platform::SocketCleanup();
+        return false;
+    }
+
     // 리슨 소켓 "후" 준비 — RIO 팔은 함수 테이블 probe에 소켓이 필요하고, 슬랩 등록·세션 링
     // 슬라이스·워커 CQ를 여기서 만든다. 실패 시 내부에서 정리하고 false를 돌린다.
     if (!TransportPostListen())
+    {
+        CloseExtraListenSockets();
         return false;
+    }
 
     InterlockedExchange(&_running, TRUE);
 
@@ -244,7 +260,9 @@ bool CIOCPServer::Start()
     TransportStartWorkers();
 
     // Accept 스레드 생성
-    _acceptThread = std::thread(&CIOCPServer::AcceptThread, this);
+    _acceptThread = std::thread(&CIOCPServer::AcceptThread, this, _listenSocket, 0);
+    for (ExtraListener& listener : _extraListeners)
+        listener.thread = std::thread(&CIOCPServer::AcceptThread, this, listener.socket, listener.tag);
 
     const char* modeName = "Unknown";
     switch (_serverMode)
@@ -258,46 +276,142 @@ bool CIOCPServer::Start()
 }
 
 
-bool CIOCPServer::CreateListenSocket()
+// 전송 방식에 맞는 플래그로 소켓을 만든다 — 받는 소켓과 거는 소켓이 같은 길을 쓴다.
+//   RIO는 플래그가 있어야 요청 큐를 만들 수 있다 (받은 소켓은 리슨 소켓의 플래그를 물려받는다).
+static SOCKET CreateTransportSocket(uint32_t flags)
 {
 #ifdef _WIN32
-    _listenSocket = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, TransportListenFlags());
+    return WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, flags);
 #else
     // 리눅스에는 WSASocket의 플래그(OVERLAPPED/REGISTERED_IO) 개념이 없다.
     //   비동기 성격은 소켓이 아니라 이벤트 루프(epoll) 쪽에서 정해진다.
-    (void)TransportListenFlags();
-    _listenSocket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    (void)flags;
+    return ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 #endif
-    if (_listenSocket == INVALID_SOCKET)
+}
+
+SOCKET CIOCPServer::OpenListenSocket(uint32_t addrNetOrder, int port)
+{
+    SOCKET listenSocket = CreateTransportSocket(TransportListenFlags());
+    if (listenSocket == INVALID_SOCKET)
     {
         const int wsaErr = Platform::LastSocketError();
         SLOG_ERROR("WSASocket failed: {}", wsaErr);
-        return false;
+        return INVALID_SOCKET;
     }
 
     SOCKADDR_IN serverAddr;
     ZeroMemory(&serverAddr, sizeof(serverAddr));
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = htonl(INADDR_ANY);
-    serverAddr.sin_port = htons(_port);
+    serverAddr.sin_addr.s_addr = addrNetOrder;
+    serverAddr.sin_port = htons(static_cast<uint16_t>(port));
 
-    if (bind(_listenSocket, (SOCKADDR*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR)
+    if (bind(listenSocket, (SOCKADDR*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR)
     {
         const int wsaErr = Platform::LastSocketError();
-        SLOG_ERROR("bind failed: {}", wsaErr);
-        Platform::CloseSocket(_listenSocket);
+        SLOG_ERROR("bind failed: {} (port {})", wsaErr, port);
+        Platform::CloseSocket(listenSocket);
+        return INVALID_SOCKET;
+    }
+
+    if (listen(listenSocket, SOMAXCONN_HINT(1024)) == SOCKET_ERROR)
+    {
+        const int wsaErr = Platform::LastSocketError();
+        SLOG_ERROR("listen failed: {} (port {})", wsaErr, port);
+        Platform::CloseSocket(listenSocket);
+        return INVALID_SOCKET;
+    }
+
+    return listenSocket;
+}
+
+bool CIOCPServer::CreateListenSocket()
+{
+    _listenSocket = OpenListenSocket(htonl(INADDR_ANY), _port);
+    return _listenSocket != INVALID_SOCKET;
+}
+
+bool CIOCPServer::AddListener(const char* ip, int port, int tag)
+{
+    if (_running == TRUE)
+    {
+        SLOG_ERROR("AddListener: Start 전에 불러야 한다 (port {})", port);
         return false;
     }
 
-    if (listen(_listenSocket, SOMAXCONN_HINT(1024)) == SOCKET_ERROR)
+    in_addr addr;
+    if (ip == nullptr || inet_pton(AF_INET, ip, &addr) != 1)
     {
-        const int wsaErr = Platform::LastSocketError();
-        SLOG_ERROR("listen failed: {}", wsaErr);
-        Platform::CloseSocket(_listenSocket);
+        SLOG_ERROR("AddListener: 주소가 틀렸다 '{}' (port {})", (ip != nullptr) ? ip : "", port);
         return false;
     }
 
+    ExtraListener listener;
+    listener.addrNetOrder = addr.s_addr;
+    listener.port = port;
+    listener.tag = tag;
+    _extraListeners.push_back(std::move(listener));
     return true;
+}
+
+bool CIOCPServer::CreateExtraListenSockets()
+{
+    for (ExtraListener& listener : _extraListeners)
+    {
+        listener.socket = OpenListenSocket(listener.addrNetOrder, listener.port);
+        if (listener.socket == INVALID_SOCKET)
+            return false;
+    }
+    return true;
+}
+
+void CIOCPServer::CloseExtraListenSockets()
+{
+    for (ExtraListener& listener : _extraListeners)
+    {
+        if (listener.socket != INVALID_SOCKET)
+        {
+            Platform::CloseSocket(listener.socket);
+            listener.socket = INVALID_SOCKET;
+        }
+    }
+}
+
+int64_t CIOCPServer::ConnectTo(const char* ip, int port, int tag)
+{
+    if (_running != TRUE)
+        return 0;
+
+    in_addr addr;
+    if (ip == nullptr || inet_pton(AF_INET, ip, &addr) != 1)
+    {
+        SLOG_ERROR("ConnectTo: 주소가 틀렸다 '{}' (port {})", (ip != nullptr) ? ip : "", port);
+        return 0;
+    }
+
+    SOCKET socket = CreateTransportSocket(TransportListenFlags());
+    if (socket == INVALID_SOCKET)
+    {
+        const int wsaErr = Platform::LastSocketError();
+        SLOG_ERROR("ConnectTo: 소켓 생성 실패 {}", wsaErr);
+        return 0;
+    }
+
+    SOCKADDR_IN peerAddr;
+    ZeroMemory(&peerAddr, sizeof(peerAddr));
+    peerAddr.sin_family = AF_INET;
+    peerAddr.sin_addr = addr;
+    peerAddr.sin_port = htons(static_cast<uint16_t>(port));
+
+    if (connect(socket, (SOCKADDR*)&peerAddr, sizeof(peerAddr)) == SOCKET_ERROR)
+    {
+        // 상대가 아직 없는 것은 정상 상황이라 오류 로그를 남기지 않는다 — 재접속 쪽이 상태를 본다.
+        Platform::CloseSocket(socket);
+        return 0;
+    }
+
+    SetSocketOptions(socket);
+    return ProcessAccept(socket, tag);
 }
 
 
@@ -372,10 +486,27 @@ void CIOCPServer::ShutdownServer()
         ::shutdown(_listenSocket, SHUT_RDWR);
 #endif
     }
+    for (ExtraListener& listener : _extraListeners)
+    {
+        if (listener.socket != INVALID_SOCKET)
+        {
+#ifdef _WIN32
+            Platform::CloseSocket(listener.socket);
+            listener.socket = INVALID_SOCKET;
+#else
+            ::shutdown(listener.socket, SHUT_RDWR);
+#endif
+        }
+    }
 
     if (_acceptThread.joinable())
     {
         _acceptThread.join();
+    }
+    for (ExtraListener& listener : _extraListeners)
+    {
+        if (listener.thread.joinable())
+            listener.thread.join();
     }
 
 #ifndef _WIN32
@@ -385,6 +516,7 @@ void CIOCPServer::ShutdownServer()
         Platform::CloseSocket(_listenSocket);
         _listenSocket = INVALID_SOCKET;
     }
+    CloseExtraListenSockets();
 #endif
 
     // IOCount 드레인 "전" 정지 (팔별) — IOCP는 송신 워커를 먼저 멈춰야 pin한 IOCount가 풀린다.
@@ -434,7 +566,7 @@ void CIOCPServer::ShutdownServer()
 
 // accept에는 timeout 기능이 없음. 종료 시 ShutdownServer가 리슨 소켓을 정지시켜 깨운다
 // (윈도우는 closesocket, 리눅스는 shutdown — 리눅스 close는 블록된 accept를 못 깨운다).
-void CIOCPServer::AcceptThread()
+void CIOCPServer::AcceptThread(SOCKET listenSocket, int tag)
 {
     CoreAffinity::PinIoThread();   // Accept 스레드 → 게임코어 밖으로 (격리 off면 no-op)
 
@@ -447,7 +579,7 @@ void CIOCPServer::AcceptThread()
         socklen_t addrLen = sizeof(clientAddr);   // POSIX accept는 socklen_t*를 받는다
 #endif
 
-        SOCKET clientSocket = accept(_listenSocket, (SOCKADDR*)&clientAddr, &addrLen);
+        SOCKET clientSocket = accept(listenSocket, (SOCKADDR*)&clientAddr, &addrLen);
 
 
         if (clientSocket == INVALID_SOCKET)
@@ -461,21 +593,34 @@ void CIOCPServer::AcceptThread()
         }
 
         SetSocketOptions(clientSocket);
-        ProcessAccept(clientSocket);
+        ProcessAccept(clientSocket, tag);
     }
 }
 
-void CIOCPServer::ProcessAccept(SOCKET clientSocket)
+// 부르는 자리가 여럿이다 — 포트마다 도는 접속 받는 스레드와 ConnectTo를 부르는 스레드.
+//   안에서 쓰는 것(빈 인덱스 스택·고유 번호·지표·이벤트 큐·타이밍 휠 요청 큐)이 모두 여러 스레드에서 안전하다.
+int64_t CIOCPServer::ProcessAccept(SOCKET clientSocket, int tag)
 {
     // 과부하 차단 — 게임 스레드가 유입을 못 따라가면 새 접속을 받지 않는다.
     //   드롭(이동 패킷 유실)도 워커 정지(전 세션 수신 멎음)도 못 쓰니 남는 수단은 이것뿐이다.
     //   값은 게임루프가 매 틱 갱신하는 스냅샷이라 락 없이 읽고, 로그 대신 카운터만 올린다.
-    if (_eventQueueAcceptLimit > 0 &&
+    //   구분 값이 있는 연결은 막지 않는다 — 과부하 때 서버 간 연결이 끊긴 채 다시 못 붙으면 복구 길이 사라진다.
+    if (tag == 0 && _eventQueueAcceptLimit > 0 &&
         _monitor._gameLoop._eventQueueSize >= _eventQueueAcceptLimit)
     {
         _monitor._acceptRejectedByQueue.Inc();
         Platform::CloseSocket(clientSocket);
-        return;
+        return 0;
+    }
+
+    // 구분 값 0 세션 상한 — 세션 표의 남은 자리를 구분 값이 있는 연결 몫으로 남긴다.
+    if (tag == 0 && _untaggedSessionLimit > 0 &&
+        _monitor._sessionCount.Load() >= _untaggedSessionLimit)
+    {
+        LOG_ERROR_STREAM("[Error] Untagged session limit reached");
+        _monitor._acceptFailed.Inc();
+        Platform::CloseSocket(clientSocket);
+        return 0;
     }
 
     // 빈 인덱스 확인 (여유가 없다면 동접 max)
@@ -485,7 +630,7 @@ void CIOCPServer::ProcessAccept(SOCKET clientSocket)
         LOG_ERROR_STREAM("[Error] No free session index available");
         _monitor._acceptFailed.Inc();
         Platform::CloseSocket(clientSocket);
-        return;
+        return 0;
     }
 
     // 고유 ID 생성 (하위 48비트만 사용)
@@ -495,14 +640,18 @@ void CIOCPServer::ProcessAccept(SOCKET clientSocket)
     int64_t sessionId = CSession::MakeSessionId(index, uniqueId);
 
     // session 초기화. 사용가능한 상태가 됨
-    _sessions[index]->Initialize(clientSocket, sessionId);
+    _sessions[index]->Initialize(clientSocket, sessionId, tag);
 
     // 세션 지표 기록 — Initialize 직후에 올린다.
     //   아래 BindIOCP(RIO 모드에서는 워커의 RQ 생성)가 실패하면 ReleaseSession 경로로 빠지는데,
     //   거기서는 sessionId만 보고 무조건 감소시킨다. 증가를 성공 경로에만 두면 실패 시
     //   감소만 일어나 동접 게이지가 음수 방향으로 영구히 밀린다.
+    //   구분 값이 있는 연결은 동접 수에 넣지 않고 따로 센다 — 빼는 자리(ReleaseSession)도 같이 나뉜다.
     _monitor._sessionCreated.Inc();
-    _monitor._sessionCount.Inc();
+    if (tag == 0)
+        _monitor._sessionCount.Inc();
+    else
+        _monitor._taggedSessionCount.Inc();
 
     // 완료 통지 연결 (팔별) — IOCP는 소켓을 완료 포트에 붙인다. RIO는 소유 워커가 RQ 생성 시 처리.
     if (!TransportAttachSession(_sessions[index].get(), clientSocket))
@@ -511,7 +660,7 @@ void CIOCPServer::ProcessAccept(SOCKET clientSocket)
         // RequestDisconnectSession → ReleaseSession(IOCount→0)으로 정리
         RequestDisconnectSession(_sessions[index].get());
         IOCountDecrement(_sessions[index].get());
-        return;
+        return 0;
     }
 
     // 컨텐츠쪽 전달
@@ -522,7 +671,7 @@ void CIOCPServer::ProcessAccept(SOCKET clientSocket)
         // 에코 모드: 컨텐츠 레이어 없음
         break;
     case ServerMode::GameServer:
-        PushNetworkEvent(NetworkEvent(NetworkEvent::Type::CONNECTED, sessionId));
+        PushNetworkEvent(NetworkEvent(NetworkEvent::Type::CONNECTED, sessionId, tag));
         break;
     }
 
@@ -531,6 +680,7 @@ void CIOCPServer::ProcessAccept(SOCKET clientSocket)
 
     // 첫 Recv 착수 (팔별) — Initialize의 IOCount=1이 이 IO의 ref. AcquireSession 불필요.
     TransportStartFirstRecv(_sessions[index].get(), clientSocket, sessionId);
+    return sessionId;
 }
 
 // Recv 완료 통지 처리
@@ -652,7 +802,7 @@ void CIOCPServer::ParsePackets(CSession* session)
         {
             ThreadSafeQueue<NetworkEvent>* target = session->_recvEventQueue.load(std::memory_order_acquire);
             PushNetworkEvent(NetworkEvent(NetworkEvent::Type::RECEIVED,
-                session->_sessionId, pMsg), target ? *target : _eventQueue);
+                session->_sessionId, pMsg, session->_tag), target ? *target : _eventQueue);
             break;
         }
         default:
@@ -1165,6 +1315,7 @@ void CIOCPServer::ReleaseSession(CSession* session)
     }
 
     const int64_t sessionId = session->_sessionId;
+    const int tag = session->_tag;
 
     // 컨텐츠 알림 — IOCount==0이므로 이후 RECEIVED 이벤트 불가. 이벤트 순서 보장.
     // 서버 종료 중(_running==false)에는 알림 생략.
@@ -1173,7 +1324,7 @@ void CIOCPServer::ReleaseSession(CSession* session)
         switch (_serverMode)
         {
         case ServerMode::GameServer:
-            PushNetworkEvent(NetworkEvent(NetworkEvent::Type::DISCONNECTED, sessionId));
+            PushNetworkEvent(NetworkEvent(NetworkEvent::Type::DISCONNECTED, sessionId, tag));
             break;
         default:
             break;
@@ -1209,7 +1360,10 @@ void CIOCPServer::ReleaseSession(CSession* session)
     {
         // 세션 지표 기록
         _monitor._sessionDestroyed.Inc();
-        _monitor._sessionCount.Add(-1);
+        if (tag == 0)
+            _monitor._sessionCount.Add(-1);
+        else
+            _monitor._taggedSessionCount.Add(-1);
 
         _availableIndices.Push(CSession::ExtractIndex(sessionId));
     }
