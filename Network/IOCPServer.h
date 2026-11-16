@@ -108,6 +108,15 @@ public:
     volatile SOCKET _socket;
     volatile int64_t _sessionId;    // Initialize에서 설정, IOCount>0 동안 유효
     int _tag = 0;                   // 구분 값 — 어느 포트로 온 연결인가. 0 = 생성자 포트. Initialize에서 정하고 세션이 끝날 때까지 안 바뀐다
+    // 끊긴 까닭 — 먼저 적은 하나만 남는다(MarkDisconnectReason). Initialize에서 「아직 없음」으로 되돌리고 ReleaseSession이 읽는다.
+    //   끊는 자리마다 한 번 쓰고 마는 칸이라 _tag 옆에 둔다(입출력마다 바뀌는 칸이 아니다)
+    static constexpr uint8_t DISCONNECT_REASON_UNSET = 0xFF;
+    std::atomic<uint8_t> _disconnectReason{ DISCONNECT_REASON_UNSET };
+    void MarkDisconnectReason(DisconnectReason reason)
+    {
+        uint8_t expected = DISCONNECT_REASON_UNSET;
+        _disconnectReason.compare_exchange_strong(expected, static_cast<uint8_t>(reason), std::memory_order_relaxed);
+    }
     // [다중 pending 송신] 1-pending 시절의 _sending 하나를 두 역할로 나눈 것 —
     //   _sendSubmitBusy : 제출 구간만 잠근다(세그먼트 계산~제출 호출). 제출자가 둘인 IOCP 팔
     //                     (송신 워커 + 완료 워커의 이어보내기)에서 제출 순서=와이어 순서를 지킨다.
@@ -341,6 +350,7 @@ class CIOCPServer
 {
 public:
     // serverName = 기동 로그에 싣는 이름 — 쓰는 쪽이 정한다(이 라이브러리는 서버 종류를 모른다)
+    //   port 0 = 생성자 포트를 열지 않는다(듣기 없음) — 붙기만 하는 서버(ConnectTo)나 듣기를 모두 AddListener 로 주는 서버
     explicit CIOCPServer(int port, int maxClients, const char* serverName,
                         CMonitorManager& monitor, int workerThreads = 0, int sendWorkers = 0,
                         int rioWorkers = 0, int completionBatch = 0, int sendDepth = 1);
@@ -350,7 +360,11 @@ public:
     //   ip   = 접속을 기다릴 주소. 이 주소로 온 접속만 받는다 (생성자 포트는 지금처럼 모든 주소)
     //   tag  = 이 포트로 온 세션의 구분 값. 이벤트마다 실려 나가므로 받는 쪽이 처리표를 고를 수 있다
     // 반환: 주소가 틀렸거나 이미 Start했으면 false. bind·listen 실패는 Start가 false를 돌린다.
+    //   port 0 = OS 가 빈 포트를 고른다 — 고른 포트는 Start 뒤 GetListenerPort 로 읽는다
     bool AddListener(const char* ip, int port, int tag);
+
+    // AddListener 로 연 i 번째 포트(부른 차례 · 0 부터)의 실제 포트. Start 가 성공한 뒤에 읽는다. 없거나 아직 안 열었으면 0
+    int GetListenerPort(size_t i) const { return (i < _extraListeners.size()) ? _extraListeners[i].boundPort : 0; }
 
     // 다른 서버에 접속해, 받은 접속과 같은 경로로 세션에 등록한다. Start 뒤에 부른다.
     //   연결되거나 실패할 때까지 막히므로 틱을 도는 스레드에서 부르지 말 것.
@@ -402,6 +416,7 @@ public:
     // 게임 스레드가 여럿일 때 — 부르는 스레드 자기 묶음에 쌓는다. 틱 끝에 같은 묶음으로 FlushPendingSends를 부를 것.
     bool RequestSendRaw(CSendBatch& batch, int64_t sessionId, const char* data, int size);
 
+    // 쓰는 쪽이 끊는다 — 끊긴 까닭은 LocalRequest(다른 까닭이 먼저 적혔으면 그것)
     bool RequestDisconnectSession(int64_t sessionId);
 
     // [coalescing] 게임 루프가 틱 끝에 1회 호출 — 이번 틱에 enqueue된 세션을 한 번에 flush (게임 스레드 단독)
@@ -434,6 +449,7 @@ public:
     // 내부에서 사용할 함수
 private:
     bool RequestDisconnectSession(CSession* session);
+    bool RequestDisconnectSession(int64_t sessionId, DisconnectReason reason);   // 세션 번호를 확인한 뒤 까닭을 적고 끊는다
     void ReleaseSession(CSession* session);
 
 private:
@@ -475,7 +491,9 @@ private:
     bool BindIOCP(SOCKET socket, ULONG_PTR completionKey);
 #endif
 
-    int64_t ProcessAccept(SOCKET clientSocket, int tag);   // 반환: 세션 번호. 거절하면 0
+    // peer = 상대 주소(accept 의 주소 칸 · ConnectTo 가 건 주소) · outbound = ConnectTo 로 건 접속
+    int64_t ProcessAccept(SOCKET clientSocket, int tag, const SOCKADDR_IN& peer, bool outbound);   // 반환: 세션 번호. 거절하면 0
+    void NotifyRefused(int tag, RefuseReason reason, const SOCKADDR_IN& peer, bool outbound);      // 받은 것 넘길 곳에 거절 알림(받은 접속만)
     void ProcessRecv(CSession* session, DWORD bytesTransferred);
     // slot = 이 완료가 쓴 in-flight 슬롯 (IOCP는 OverlappedEx.slot, RIO는 RequestContext에서 얻는다)
     void ProcessSend(CSession* session, DWORD bytesTransferred, int slot);
@@ -565,6 +583,7 @@ private:
     {
         uint32_t    addrNetOrder = 0;   // 접속을 기다릴 주소 (네트워크 바이트 순서)
         int         port = 0;
+        int         boundPort = 0;      // 실제로 연 포트 — port 0 이면 OS 가 고른 값(Start 가 채운다)
         int         tag = 0;
         SOCKET      socket = INVALID_SOCKET;
         std::thread thread;

@@ -39,6 +39,7 @@ void CSession::Initialize(SOCKET socket, int64_t sessionId, int tag)
     _socket = socket;
     _sessionId = sessionId;
     _tag = tag;
+    _disconnectReason.store(DISCONNECT_REASON_UNSET, std::memory_order_relaxed);
     _disconnecting = FALSE;
     _sendSubmitBusy = FALSE;
     _sendInFlight = 0;
@@ -236,8 +237,8 @@ bool CIOCPServer::Start()
         return false;
     }
 
-    // Listen 소켓 생성
-    if (!CreateListenSocket())
+    // Listen 소켓 생성 — 생성자 포트 0 이면 열지 않는다(듣기 없음 · 접속 받는 스레드도 없다)
+    if (_port != 0 && !CreateListenSocket())
     {
         TransportPreListenCleanup();
         Platform::SocketCleanup();
@@ -249,7 +250,8 @@ bool CIOCPServer::Start()
     if (!CreateExtraListenSockets())
     {
         CloseExtraListenSockets();
-        Platform::CloseSocket(_listenSocket);
+        if (_listenSocket != INVALID_SOCKET)
+            Platform::CloseSocket(_listenSocket);
         _listenSocket = INVALID_SOCKET;
         TransportPreListenCleanup();
         Platform::SocketCleanup();
@@ -289,8 +291,11 @@ bool CIOCPServer::Start()
     // 완료 워커·송신 워커 기동 (팔별) — 워커가 읽는 설정은 기동 "전"에 확정된다.
     TransportStartWorkers();
 
-    // Accept 스레드 생성
-    _acceptThread = std::thread(&CIOCPServer::AcceptThread, this, _listenSocket, 0);
+    // Accept 스레드 생성 — 생성자 포트를 안 열었으면(0) 없다
+    if (_listenSocket != INVALID_SOCKET)
+        _acceptThread = std::thread(&CIOCPServer::AcceptThread, this, _listenSocket, 0);
+    else
+        SLOG_INFO("[Network] Constructor port = none (listeners {})", _extraListeners.size());
     for (ExtraListener& listener : _extraListeners)
         listener.thread = std::thread(&CIOCPServer::AcceptThread, this, listener.socket, listener.tag);
 
@@ -427,6 +432,16 @@ bool CIOCPServer::CreateExtraListenSockets()
         listener.socket = OpenListenSocket(listener.addrNetOrder, listener.port);
         if (listener.socket == INVALID_SOCKET)
             return false;
+
+        // 실제로 연 포트 — port 0 이면 OS 가 고른 값이다(GetListenerPort)
+        SOCKADDR_IN bound;
+        ZeroMemory(&bound, sizeof(bound));
+#ifdef _WIN32
+        int boundLen = sizeof(bound);
+#else
+        socklen_t boundLen = sizeof(bound);
+#endif
+        listener.boundPort = (getsockname(listener.socket, (SOCKADDR*)&bound, &boundLen) == 0) ? ntohs(bound.sin_port) : listener.port;
     }
     return true;
 }
@@ -477,7 +492,7 @@ int64_t CIOCPServer::ConnectTo(const char* ip, int port, int tag)
     }
 
     SetSocketOptions(socket);
-    return ProcessAccept(socket, tag);
+    return ProcessAccept(socket, tag, peerAddr, true);
 }
 
 
@@ -659,13 +674,21 @@ void CIOCPServer::AcceptThread(SOCKET listenSocket, int tag)
         }
 
         SetSocketOptions(clientSocket);
-        ProcessAccept(clientSocket, tag);
+        ProcessAccept(clientSocket, tag, clientAddr, false);
     }
 }
 
 // 부르는 자리가 여럿이다 — 포트마다 도는 접속 받는 스레드와 ConnectTo를 부르는 스레드.
 //   안에서 쓰는 것(빈 인덱스 스택·고유 번호·지표·이벤트 큐·타이밍 휠 요청 큐)이 모두 여러 스레드에서 안전하다.
-int64_t CIOCPServer::ProcessAccept(SOCKET clientSocket, int tag)
+// 거절 알림 — 받은 것 넘길 곳이 있고 받은 접속일 때만. ConnectTo 는 0 을 돌려 알린다
+void CIOCPServer::NotifyRefused(int tag, RefuseReason reason, const SOCKADDR_IN& peer, bool outbound)
+{
+    if (!_recvSink || outbound)
+        return;
+    _recvSink->OnRefused(SinkRefused{ tag, reason, peer.sin_addr.s_addr, ntohs(peer.sin_port) });
+}
+
+int64_t CIOCPServer::ProcessAccept(SOCKET clientSocket, int tag, const SOCKADDR_IN& peer, bool outbound)
 {
     // 과부하 차단 — 게임 스레드가 유입을 못 따라가면 새 접속을 받지 않는다.
     //   드롭(이동 패킷 유실)도 워커 정지(전 세션 수신 멎음)도 못 쓰니 남는 수단은 이것뿐이다.
@@ -676,6 +699,7 @@ int64_t CIOCPServer::ProcessAccept(SOCKET clientSocket, int tag)
     {
         _monitor._acceptRejectedByQueue.Inc();
         Platform::CloseSocket(clientSocket);
+        NotifyRefused(tag, RefuseReason::EventQueueBusy, peer, outbound);
         return 0;
     }
 
@@ -686,6 +710,7 @@ int64_t CIOCPServer::ProcessAccept(SOCKET clientSocket, int tag)
         LOG_ERROR_STREAM("[Error] Untagged session limit reached");
         _monitor._acceptFailed.Inc();
         Platform::CloseSocket(clientSocket);
+        NotifyRefused(tag, RefuseReason::UntaggedLimit, peer, outbound);
         return 0;
     }
 
@@ -696,6 +721,7 @@ int64_t CIOCPServer::ProcessAccept(SOCKET clientSocket, int tag)
         LOG_ERROR_STREAM("[Error] No free session index available");
         _monitor._acceptFailed.Inc();
         Platform::CloseSocket(clientSocket);
+        NotifyRefused(tag, RefuseReason::SessionTableFull, peer, outbound);
         return 0;
     }
 
@@ -730,8 +756,29 @@ int64_t CIOCPServer::ProcessAccept(SOCKET clientSocket, int tag)
     }
 
     // 컨텐츠쪽 전달 — 받은 것 넘길 곳이 있으면 이 스레드에서 바로, 없으면 이벤트 큐로
+    //   주소 칸은 넘길 곳이 있을 때만 채운다 — 이쪽 주소(getsockname)는 시스템 호출 하나라 큐 길에는 안 붙인다
     if (_recvSink)
-        _recvSink->OnConnected(SinkConnected{ sessionId, tag });
+    {
+        SinkConnected info;
+        info.sessionId = sessionId;
+        info.tag = tag;
+        info.outbound = outbound;
+        info.peerIp = peer.sin_addr.s_addr;
+        info.peerPort = ntohs(peer.sin_port);
+        SOCKADDR_IN local;
+        ZeroMemory(&local, sizeof(local));
+#ifdef _WIN32
+        int localLen = sizeof(local);
+#else
+        socklen_t localLen = sizeof(local);
+#endif
+        if (getsockname(clientSocket, (SOCKADDR*)&local, &localLen) == 0)
+        {
+            info.localIp = local.sin_addr.s_addr;
+            info.localPort = ntohs(local.sin_port);
+        }
+        _recvSink->OnConnected(info);
+    }
     else
         PushNetworkEvent(NetworkEvent(NetworkEvent::Type::CONNECTED, sessionId, tag));
 
@@ -814,6 +861,7 @@ void CIOCPServer::ParsePackets(CSession* session)
             _monitor._packetErrors.Inc();
             if (parsedPackets != 0)
                 _monitor._recvPackets.Add(parsedPackets);
+            session->MarkDisconnectReason(DisconnectReason::BadMessage);
             RequestDisconnectSession(session);
             return;
         }
@@ -1126,6 +1174,7 @@ bool CIOCPServer::RequestSendMsg(int64_t sessionId, CSerialBuffer* pMsg, [[maybe
             << ", Depth: " << session->_sendQ.GetApproxSize());
         _monitor._sendQueueOverflow.Inc();
         pMsg->SubRef();
+        session->MarkDisconnectReason(DisconnectReason::SendOverflow);
         RequestDisconnectSession(session);
         IOCountDecrement(session);
         return false;
@@ -1137,6 +1186,7 @@ bool CIOCPServer::RequestSendMsg(int64_t sessionId, CSerialBuffer* pMsg, [[maybe
         LOG_ERROR_STREAM("[Error] Send queue enqueue failed - SessionId: " << sessionId);
         _monitor._sendQueueOverflow.Inc();
         pMsg->SubRef();
+        session->MarkDisconnectReason(DisconnectReason::SendOverflow);
         RequestDisconnectSession(session);
         IOCountDecrement(session);
         return false;
@@ -1150,6 +1200,7 @@ bool CIOCPServer::RequestSendMsg(int64_t sessionId, CSerialBuffer* pMsg, [[maybe
             << ", Requested: " << dataSize << ", Enqueued: " << enqueued);
         _monitor._sendQueueOverflow.Inc();
         pMsg->SubRef();
+        session->MarkDisconnectReason(DisconnectReason::SendOverflow);
         RequestDisconnectSession(session);
         IOCountDecrement(session);
         return false;
@@ -1202,6 +1253,7 @@ bool CIOCPServer::RequestSendRaw(CSendBatch& batch, int64_t sessionId, const cha
         LOG_ERROR_STREAM("[Error] Send buffer overflow (digest) - SessionId: " << sessionId
             << ", Requested: " << size << ", Enqueued: " << enqueued);
         _monitor._sendQueueOverflow.Inc();
+        session->MarkDisconnectReason(DisconnectReason::SendOverflow);
         RequestDisconnectSession(session);
         IOCountDecrement(session);
         return false;
@@ -1356,7 +1408,13 @@ void CIOCPServer::ReleaseSession(CSession* session)
     if (sessionId != 0 && _running == TRUE)
     {
         if (_recvSink)
-            _recvSink->OnDisconnected(SinkDisconnected{ sessionId, tag });
+        {
+            // 아무 표식 없이 끊겼으면 입출력 실패다(상대의 강제 끊기 · 보내기 실패 · 종료 유도의 취소 완료)
+            const uint8_t mark = session->_disconnectReason.load(std::memory_order_acquire);
+            const DisconnectReason reason = (mark == CSession::DISCONNECT_REASON_UNSET)
+                ? DisconnectReason::IoError : static_cast<DisconnectReason>(mark);
+            _recvSink->OnDisconnected(SinkDisconnected{ sessionId, tag, reason });
+        }
         else
             PushNetworkEvent(NetworkEvent(NetworkEvent::Type::DISCONNECTED, sessionId, tag));
     }
@@ -1402,6 +1460,11 @@ void CIOCPServer::ReleaseSession(CSession* session)
 
 bool CIOCPServer::RequestDisconnectSession(int64_t sessionId)
 {
+    return RequestDisconnectSession(sessionId, DisconnectReason::LocalRequest);
+}
+
+bool CIOCPServer::RequestDisconnectSession(int64_t sessionId, DisconnectReason reason)
+{
     // Session ABA 검증 (3-step)
     // Step 1: index로 세션 조회 + sessionId 일치 확인
     auto session = FindSession(sessionId);
@@ -1419,6 +1482,7 @@ bool CIOCPServer::RequestDisconnectSession(int64_t sessionId)
         return false;
     }
 
+    session->MarkDisconnectReason(reason);   // pin · 번호 확인 뒤 — 다시 쓰인 자리의 새 세션에 적지 않게
     const bool disconnected = RequestDisconnectSession(session);
     IOCountDecrement(session);
     return disconnected;
@@ -1430,7 +1494,7 @@ void CIOCPServer::OnSessionTimeout(void* context, int64_t sessionId)
 {
     auto* server = static_cast<CIOCPServer*>(context);
     server->_monitor._sessionTimedOut.Inc();
-    server->RequestDisconnectSession(sessionId);
+    server->RequestDisconnectSession(sessionId, DisconnectReason::IdleTimeout);
 }
 
 // 여러 스레드에서 접근가능 — ref를 잡지 않으므로 반환된 포인터는 잠정적이다.

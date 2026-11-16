@@ -481,6 +481,7 @@ void CIOCPServer::EpollHandleReadable(CSession* session)
 
         if (n == 0)
         {
+            session->MarkDisconnectReason(DisconnectReason::PeerClosed);
             RequestDisconnectSession(session);      // 상대의 우아한 종료(FIN)
             break;
         }

@@ -59,7 +59,17 @@ void CIOCPServer::TransportPreListenCleanup()
 //   스레드 기동 전(pre-_running)에 실패 가능한 자원을 전부 확보한다.
 bool CIOCPServer::TransportPostListen()
 {
-    bool rioReady = CRioApi::Load(_listenSocket);
+    // 함수 표는 아무 소켓으로나 얻는다 — 생성자 포트를 안 열었으면(0) 같은 플래그의 소켓을 잠깐 연다
+    SOCKET probe = _listenSocket;
+    SOCKET ownProbe = INVALID_SOCKET;
+    if (probe == INVALID_SOCKET)
+    {
+        ownProbe = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, TransportListenFlags());
+        probe = ownProbe;
+    }
+    bool rioReady = (probe != INVALID_SOCKET) && CRioApi::Load(probe);
+    if (ownProbe != INVALID_SOCKET)
+        closesocket(ownProbe);
 
     const size_t perSession = RIO_RECV_RING_SIZE + RIO_SEND_RING_SIZE;
     if (rioReady && !_rioSlab.Init(perSession * static_cast<size_t>(_maxClients)))
@@ -126,7 +136,8 @@ bool CIOCPServer::TransportPostListen()
         }
         _rioWorkers.clear();
         _rioSlab.Release();
-        closesocket(_listenSocket);
+        if (_listenSocket != INVALID_SOCKET)
+            closesocket(_listenSocket);
         _listenSocket = INVALID_SOCKET;
         WSACleanup();
         return false;
@@ -467,6 +478,9 @@ int CIOCPServer::RioDrainCompletions(RioWorker& worker, int monitorIndex)
         }
         else
         {
+            // 받기가 성공으로 0바이트 = 상대가 정상으로 닫음(IOCP 팔 HandleCompletion 과 같은 판정)
+            if (isRecv && results[i].Status == NO_ERROR && bytes == 0)
+                session->MarkDisconnectReason(DisconnectReason::PeerClosed);
             RequestDisconnectSession(session);
         }
 

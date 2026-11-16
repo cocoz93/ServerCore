@@ -19,10 +19,36 @@ class CSerialBuffer;
 //   왜 알림을 구조체로 넘기나 — 칸을 더해도(접속한 주소 · 끊긴 까닭 등) 부르는 꼴이 안 바뀐다.
 //==================================================
 
+// 끊긴 까닭 — 세션마다 먼저 일어난 하나만 남는다(뒤에 겹친 것은 버린다).
+//   쓰는 쪽은 기록 줄 · 셈에 쓴다. 코어의 끊기 동작은 까닭에 따라 안 바뀐다.
+enum class DisconnectReason : uint8_t
+{
+    IoError = 0,    // 입출력 실패 · 상대의 강제 끊기 — 아래 어느 표식도 없이 끊긴 것
+    PeerClosed,     // 상대가 정상으로 닫음(받기가 0바이트)
+    LocalRequest,   // 쓰는 쪽이 RequestDisconnectSession 을 부름
+    IdleTimeout,    // 쉬는 접속 끊기(SetIdleTimeoutSec)
+    BadMessage,     // 자르기 부품이 받은 바이트를 틀렸다고 함(규약 위반 · 최대 넘음)
+    SendOverflow,   // 보낼 바이트가 보내기 링에 다 안 들어감
+};
+
+// 접속을 받자마자 닫은 까닭 — 세션을 안 만들어 세션 번호가 없다
+enum class RefuseReason : uint8_t
+{
+    SessionTableFull = 0,   // 세션 표에 빈자리가 없다(생성자 maxClients)
+    UntaggedLimit,          // 구분 값 0 세션 상한(SetUntaggedSessionLimit)
+    EventQueueBusy,         // 이벤트 큐 과부하(SetEventQueueAcceptLimit)
+};
+
+// 주소는 IPv4 · 주소는 네트워크 바이트 순서(in_addr.s_addr 그대로) · 포트는 호스트 바이트 순서
 struct SinkConnected
 {
-    int64_t sessionId = 0;
-    int     tag       = 0;   // 접속을 받은 포트의 구분 값(AddListener) · ConnectTo 로 건 것이면 거기 준 값 · 생성자 포트는 0
+    int64_t  sessionId = 0;
+    int      tag       = 0;       // 접속을 받은 포트의 구분 값(AddListener) · ConnectTo 로 건 것이면 거기 준 값 · 생성자 포트는 0
+    bool     outbound  = false;   // ConnectTo 로 건 접속이면 true
+    uint32_t peerIp    = 0;       // 상대 주소
+    uint16_t peerPort  = 0;
+    uint32_t localIp   = 0;       // 이쪽 주소(getsockname — 여러 주소에 연 포트면 접속이 실제로 닿은 주소)
+    uint16_t localPort = 0;
 };
 
 struct SinkReceived
@@ -34,8 +60,17 @@ struct SinkReceived
 
 struct SinkDisconnected
 {
-    int64_t sessionId = 0;
-    int     tag       = 0;
+    int64_t          sessionId = 0;
+    int              tag       = 0;
+    DisconnectReason reason    = DisconnectReason::IoError;
+};
+
+struct SinkRefused
+{
+    int          tag      = 0;   // 접속이 온 포트의 구분 값
+    RefuseReason reason   = RefuseReason::SessionTableFull;
+    uint32_t     peerIp   = 0;
+    uint16_t     peerPort = 0;
 };
 
 class CRecvSink
@@ -50,4 +85,9 @@ public:
 
     // 서버 종료 중(ShutdownServer)에는 부르지 않는다(큐 길과 같다)
     virtual void OnDisconnected(const SinkDisconnected& info) = 0;
+
+    // 듣는 포트로 온 접속을 상한에 걸려 바로 닫았다 — 접속 받는 스레드가 부른다.
+    //   기본은 아무것도 안 한다(코어 셈 _acceptFailed · _acceptRejectedByQueue 는 이것과 상관없이 는다).
+    //   ConnectTo 로 건 접속의 거절은 ConnectTo 가 0 을 돌려 알리므로 여기로 안 온다.
+    virtual void OnRefused(const SinkRefused& info) { (void)info; }
 };

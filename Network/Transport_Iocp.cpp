@@ -385,6 +385,9 @@ void CIOCPServer::HandleCompletion(OVERLAPPED* overlapped, ULONG_PTR completionK
     }
     else if (ioFailed || bytesTransferred == 0)
     {
+        // 받기가 실패 없이 0바이트 = 상대가 정상으로 닫음. 실패는 표식 없이(ReleaseSession 이 입출력 실패로 친다)
+        if (!ioFailed && op == IOOperation::RECV)
+            session->MarkDisconnectReason(DisconnectReason::PeerClosed);
         RequestDisconnectSession(session);
     }
 
