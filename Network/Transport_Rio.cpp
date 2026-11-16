@@ -41,7 +41,10 @@ namespace
 // 세션 링버퍼 준비 — RIO는 등록 슬랩의 슬라이스를 쓴다 (TransportPostListen에서 InitExternal).
 bool CIOCPServer::TransportInitSessionBuffer(CSession* session)
 {
-    (void)session;
+    // 링 크기 설정(SetSessionBufferSizes)은 안 쓴다 — 슬랩 상수가 정한다. 바꿨으면 첫 세션에서 한 번 알린다
+    if (session == _sessions.front().get()
+        && (_recvRingBytes != DEFAULT_SESSION_RING_BYTES || _sendRingBytes != DEFAULT_SESSION_RING_BYTES))
+        SLOG_WARN("[RIO] Session ring sizes ignored — slab recv {} · send {}", RIO_RECV_RING_SIZE, RIO_SEND_RING_SIZE);
     return true;
 }
 

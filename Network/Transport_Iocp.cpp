@@ -23,9 +23,9 @@
 bool CIOCPServer::TransportInitSessionBuffer(CSession* session)
 {
 #if USE_LOCKFREE_SENDQ
-    return session->_recvQ.Init() && session->_sendQ.Init(256);
+    return session->_recvQ.Init(_recvRingBytes) && session->_sendQ.Init(256);
 #else
-    return session->_recvQ.Init() && session->_sendQ.Init();
+    return session->_recvQ.Init(_recvRingBytes) && session->_sendQ.Init(_sendRingBytes);   // SetSessionBufferSizes
 #endif
 }
 

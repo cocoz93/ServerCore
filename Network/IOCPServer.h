@@ -372,8 +372,9 @@ public:
     // 다른 서버에 접속해, 받은 접속과 같은 경로로 세션에 등록한다. Start 뒤에 부른다.
     //   연결되거나 실패할 때까지 막히므로 틱을 도는 스레드에서 부르지 말 것.
     //   ShutdownServer 전에 이 함수를 부르는 스레드를 먼저 멈출 것 (종료 중 세션 표를 건드리지 않게).
+    //   timeoutMs = 붙기 한도(0 = OS 가 정한 한도 그대로). 한도 안에 못 붙으면 0 — 닿지 않는 주소에서 OS 한도만큼 막히지 않게
     // 반환: 세션 번호. 실패하면 0
-    int64_t ConnectTo(const char* ip, int port, int tag);
+    int64_t ConnectTo(const char* ip, int port, int tag, uint32_t timeoutMs = 0);
 
     // 구분 값 0 세션의 상한 (0 = 끄기). Start 전에 설정할 것.
     //   세션 표 크기는 생성자 값 그대로다 — 호출자가 생성자에 「정원 + 여유」를, 여기에 정원을 넘긴다.
@@ -397,6 +398,23 @@ public:
     // 반환: 0 ~ 상한 밖이거나 이미 Start 했으면 false
     bool SetIdleTimeoutSec(int sec);
     static constexpr int MAX_IDLE_TIMEOUT_SEC = 3600;
+
+    // TCP 살아 있음 확인 — 조용한 접속에 idleMs 뒤부터 intervalMs 간격으로 빈 확인을 보내, 죽은 상대를 끊김으로 알게 한다. Start 전에 부른다. 안 부르면 끔.
+    //   받은 접속에 켠다 · outboundToo 면 ConnectTo 로 건 접속에도. 켜기에 실패해도 접속은 그대로 둔다 — 켠 수는 GetKeepAliveOnCount.
+    //   쉬는 접속 끊기(SetIdleTimeoutSec)와 다르다 — 그쪽은 받은 바이트가 없으면 끊고, 이쪽은 상대가 살아 있으면 안 끊는다(빈 확인에 상대 커널이 답한다).
+    //   리눅스는 초 단위라 올려 맞춘다(TCP_KEEPIDLE · TCP_KEEPINTVL) · 확인 횟수는 OS 기본
+    // 반환: 한쪽만 0 이거나 이미 Start 했으면 false (둘 다 0 = 끄기)
+    bool SetKeepAlive(uint32_t idleMs, uint32_t intervalMs, bool outboundToo = false);
+    uint64_t GetKeepAliveOnCount() const { return _keepAliveOn.load(std::memory_order_relaxed); }
+
+    // 세션 링 크기(바이트) — 받기 · 보내기. Start 전에 부른다. 안 부르면 둘 다 DEFAULT_SESSION_RING_BYTES.
+    //   링은 Start 때 세션 표 크기만큼 미리 잡는다 — 표 크기 × (받기 + 보내기) 가 그대로 메모리다.
+    //   받기 링은 자르기 부품 최대(MaxMessageSize)보다 커야 한다(링은 크기 − 1 까지 담는다) — 아니면 Start 가 false.
+    //   보내기 링에 다 안 들어가면 그 접속을 끊는다(끊긴 까닭 SendOverflow) — 한 접속에 한 번에 내는 최대보다 크게 잡는다.
+    //   RIO 팔은 등록 슬랩 상수를 쓰고 이 값을 안 쓴다 · 락프리 보내기 큐(USE_LOCKFREE_SENDQ)는 보내기 값을 안 쓴다
+    // 반환: 0 이거나 이미 Start 했으면 false
+    bool SetSessionBufferSizes(size_t recvBytes, size_t sendBytes);
+    static constexpr size_t DEFAULT_SESSION_RING_BYTES = 65535;
 
     bool Start();
     void ShutdownServer();
@@ -509,6 +527,7 @@ private:
     // peer = 상대 주소(accept 의 주소 칸 · ConnectTo 가 건 주소) · outbound = ConnectTo 로 건 접속
     int64_t ProcessAccept(SOCKET clientSocket, int tag, const SOCKADDR_IN& peer, bool outbound);   // 반환: 세션 번호. 거절하면 0
     void NotifyRefused(int tag, RefuseReason reason, const SOCKADDR_IN& peer, bool outbound);      // 받은 것 넘길 곳에 거절 알림(받은 접속만)
+    void ApplyKeepAlive(SOCKET socket);   // 살아 있음 확인 켜기(SetKeepAlive 값) — 성공하면 _keepAliveOn 을 올린다
     void ProcessRecv(CSession* session, DWORD bytesTransferred);
     // slot = 이 완료가 쓴 in-flight 슬롯 (IOCP는 OverlappedEx.slot, RIO는 RequestContext에서 얻는다)
     void ProcessSend(CSession* session, DWORD bytesTransferred, int slot);
@@ -605,6 +624,13 @@ private:
     };
     std::vector<ExtraListener> _extraListeners;
     int _untaggedSessionLimit = 0;      // 구분 값 0 세션 상한 (0=끄기). 설정은 기동 전 1회, 이후 읽기 전용
+    // 살아 있음 확인(SetKeepAlive) · 세션 링 크기(SetSessionBufferSizes) — 기동 전 1회, 이후 읽기 전용
+    uint32_t _keepAliveIdleMs = 0;      // 0 = 끔
+    uint32_t _keepAliveIntervalMs = 0;
+    bool _keepAliveOutbound = false;    // ConnectTo 로 건 접속에도 켜나
+    std::atomic<uint64_t> _keepAliveOn{ 0 };   // 켜기에 성공한 소켓 수 — 접속 받는 스레드 · ConnectTo 부른 스레드가 올린다
+    size_t _recvRingBytes = DEFAULT_SESSION_RING_BYTES;
+    size_t _sendRingBytes = DEFAULT_SESSION_RING_BYTES;
 
     std::vector<std::unique_ptr<CSession>> _sessions;  // Index 기반 접근가능
     LockFree::CLockFreeStack<uint16_t> _availableIndices;  // 재사용 가능한 인덱스 스택

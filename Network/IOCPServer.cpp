@@ -9,6 +9,14 @@
 
 #include "CoreAffinity.h"
 
+#ifdef _WIN32
+#include <mstcpip.h>   // SIO_KEEPALIVE_VALS · tcp_keepalive (살아 있음 확인)
+#include <MSWSock.h>   // ConnectEx · SO_UPDATE_CONNECT_CONTEXT (붙기 한도)
+#else
+#include <fcntl.h>     // O_NONBLOCK (붙기 한도)
+#include <poll.h>      // poll (붙기 한도)
+#endif
+
 extern void SignalProcessShutdown(); // main 쪽에 정의된 종료 알림 함수
 
 
@@ -149,6 +157,15 @@ bool CIOCPServer::Start()
         return false;
     }
     SLOG_INFO("[Network] Framer = {} (max {})", _framer->Name(), _framer->MaxMessageSize());
+
+    // 받기 링이 자르기 부품 최대를 담나 — 링은 크기 − 1 까지 담는다(RingBuffer.h GetFreeSize). 못 담으면 그 크기의 메시지는 영영 다 안 모인다
+    if (_recvRingBytes <= _framer->MaxMessageSize())
+    {
+        SLOG_ERROR("[Error] Recv ring {} <= framer max {} (SetSessionBufferSizes)", _recvRingBytes, _framer->MaxMessageSize());
+        return false;
+    }
+    if (_recvRingBytes != DEFAULT_SESSION_RING_BYTES || _sendRingBytes != DEFAULT_SESSION_RING_BYTES)
+        SLOG_INFO("[Network] Session rings = recv {} · send {} (x {} sessions)", _recvRingBytes, _sendRingBytes, _maxClients);
 
     // 송신 깊이 확정 — 뒤따르는 모든 준비물이 이 값을 읽는다(RIO의 요청 큐 깊이·완료 큐 크기,
     //   워커·완료 처리의 게이트). 그래서 어떤 자원보다 먼저 정하고 이후 불변으로 둔다.
@@ -377,6 +394,41 @@ bool CIOCPServer::SetFramer(std::unique_ptr<CMessageFramer> framer)
     return true;
 }
 
+bool CIOCPServer::SetKeepAlive(uint32_t idleMs, uint32_t intervalMs, bool outboundToo)
+{
+    if (_running == TRUE)
+    {
+        SLOG_ERROR("SetKeepAlive: Start 전에 불러야 한다");
+        return false;
+    }
+    if ((idleMs == 0) != (intervalMs == 0))
+    {
+        SLOG_ERROR("SetKeepAlive: idle {}ms · interval {}ms — 둘 다 0(끄기)이거나 둘 다 0 보다 커야 한다", idleMs, intervalMs);
+        return false;
+    }
+    _keepAliveIdleMs = idleMs;
+    _keepAliveIntervalMs = intervalMs;
+    _keepAliveOutbound = outboundToo;
+    return true;
+}
+
+bool CIOCPServer::SetSessionBufferSizes(size_t recvBytes, size_t sendBytes)
+{
+    if (_running == TRUE)
+    {
+        SLOG_ERROR("SetSessionBufferSizes: Start 전에 불러야 한다");
+        return false;
+    }
+    if (recvBytes == 0 || sendBytes == 0)
+    {
+        SLOG_ERROR("SetSessionBufferSizes: recv {} · send {} — 0 은 안 된다", recvBytes, sendBytes);
+        return false;
+    }
+    _recvRingBytes = recvBytes;
+    _sendRingBytes = sendBytes;
+    return true;
+}
+
 bool CIOCPServer::SetIdleTimeoutSec(int sec)
 {
     if (_running == TRUE)
@@ -460,7 +512,75 @@ void CIOCPServer::CloseExtraListenSockets()
     }
 }
 
-int64_t CIOCPServer::ConnectTo(const char* ip, int port, int tag)
+namespace
+{
+    // 붙기 한도 — 한도까지만 기다리고, 못 붙었으면 false. 붙었으면 한도 없는 길(막는 connect)과 같은 상태로 넘긴다
+    bool ConnectWithin(SOCKET socket, const SOCKADDR_IN& peer, uint32_t timeoutMs)
+    {
+#ifdef _WIN32
+        // 윈도우는 겹친 입출력 붙기(ConnectEx)를 이벤트로 기다린다. 막지 않음 전환 + select 는 RIO 소켓이 받지 않는다 —
+        //   REGISTERED_IO 플래그 소켓에 ioctlsocket(FIONBIO) = 10045 · select · WSAPoll = 10038(루프백 실측). ConnectEx 는 두 전송 다 된다
+        //   소켓은 아직 완료 포트에 안 묶여 있어(묶기는 ProcessAccept) 완료가 이벤트로만 온다
+        LPFN_CONNECTEX connectEx = nullptr;
+        GUID guid = WSAID_CONNECTEX;
+        DWORD bytes = 0;
+        if (WSAIoctl(socket, SIO_GET_EXTENSION_FUNCTION_POINTER, &guid, sizeof(guid), &connectEx, sizeof(connectEx), &bytes, nullptr, nullptr) != 0
+            || connectEx == nullptr)
+            return false;
+        SOCKADDR_IN any;
+        ZeroMemory(&any, sizeof(any));
+        any.sin_family = AF_INET;   // ConnectEx 는 묶인 소켓만 받는다 — 막는 connect 가 몰래 하는 것과 같은 묶기(주소 아무거나 · 포트 OS)
+        if (bind(socket, reinterpret_cast<const SOCKADDR*>(&any), sizeof(any)) != 0)
+            return false;
+        WSAOVERLAPPED ov;
+        ZeroMemory(&ov, sizeof(ov));
+        ov.hEvent = WSACreateEvent();
+        if (ov.hEvent == WSA_INVALID_EVENT)
+            return false;
+        bool ok = (connectEx(socket, reinterpret_cast<const SOCKADDR*>(&peer), sizeof(peer), nullptr, 0, nullptr, &ov) == TRUE);
+        if (!ok && WSAGetLastError() == ERROR_IO_PENDING)
+        {
+            if (WaitForSingleObject(ov.hEvent, timeoutMs) != WAIT_OBJECT_0)
+                CancelIoEx(reinterpret_cast<HANDLE>(socket), &ov);   // 한도 넘음 — 거두고 아래에서 끝나기를 기다린다(ov 가 이 함수 스택이다)
+            DWORD flags = 0;
+            ok = (WSAGetOverlappedResult(socket, &ov, &bytes, TRUE, &flags) == TRUE);
+        }
+        WSACloseEvent(ov.hEvent);
+        // 붙은 소켓 문맥 갱신 — 없으면 shutdown · getpeername · getsockname 이 붙기 전 상태를 본다(ConnectEx 의 약속)
+        if (ok && setsockopt(socket, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, nullptr, 0) != 0)
+            ok = false;
+        return ok;
+#else
+        const int flags = ::fcntl(socket, F_GETFL, 0);
+        if (flags < 0 || ::fcntl(socket, F_SETFL, flags | O_NONBLOCK) != 0)
+            return false;
+        bool ok = (::connect(socket, reinterpret_cast<const sockaddr*>(&peer), sizeof(peer)) == 0);
+        if (!ok && errno == EINPROGRESS)
+        {
+            pollfd p{};
+            p.fd = socket;
+            p.events = POLLOUT;
+            const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+            int ready = 0;
+            do
+            {
+                const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(until - std::chrono::steady_clock::now()).count();
+                ready = ::poll(&p, 1, (left > 0) ? static_cast<int>(left) : 0);
+            } while (ready < 0 && errno == EINTR);   // 신호로 깬 것은 남은 한도만큼 다시 기다린다
+            if (ready > 0 && (p.revents & POLLOUT))
+            {
+                int err = 0;
+                socklen_t len = sizeof(err);
+                ok = (::getsockopt(socket, SOL_SOCKET, SO_ERROR, &err, &len) == 0 && err == 0);
+            }
+        }
+        ::fcntl(socket, F_SETFL, flags);
+        return ok;
+#endif
+    }
+}
+
+int64_t CIOCPServer::ConnectTo(const char* ip, int port, int tag, uint32_t timeoutMs)
 {
     if (_running != TRUE)
         return 0;
@@ -486,7 +606,10 @@ int64_t CIOCPServer::ConnectTo(const char* ip, int port, int tag)
     peerAddr.sin_addr = addr;
     peerAddr.sin_port = htons(static_cast<uint16_t>(port));
 
-    if (connect(socket, (SOCKADDR*)&peerAddr, sizeof(peerAddr)) == SOCKET_ERROR)
+    const bool connected = (timeoutMs == 0)
+        ? (connect(socket, (SOCKADDR*)&peerAddr, sizeof(peerAddr)) != SOCKET_ERROR)
+        : ConnectWithin(socket, peerAddr, timeoutMs);
+    if (!connected)
     {
         // 상대가 아직 없는 것은 정상 상황이라 오류 로그를 남기지 않는다 — 재접속 쪽이 상태를 본다.
         Platform::CloseSocket(socket);
@@ -690,6 +813,30 @@ void CIOCPServer::NotifyRefused(int tag, RefuseReason reason, const SOCKADDR_IN&
     _recvSink->OnRefused(SinkRefused{ tag, reason, peer.sin_addr.s_addr, ntohs(peer.sin_port) });
 }
 
+void CIOCPServer::ApplyKeepAlive(SOCKET socket)
+{
+#ifdef _WIN32
+    // SO_KEEPALIVE 를 먼저 켜 두고 값을 준다 — 값 주기(SIO_KEEPALIVE_VALS)만으로도 켜지지만, 켜짐을 옵션으로 읽을 수 있게
+    BOOL on = TRUE;
+    setsockopt(socket, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char*>(&on), sizeof(on));
+    tcp_keepalive values{};
+    values.onoff = 1;
+    values.keepalivetime = _keepAliveIdleMs;
+    values.keepaliveinterval = _keepAliveIntervalMs;
+    DWORD returned = 0;
+    if (WSAIoctl(socket, SIO_KEEPALIVE_VALS, &values, sizeof(values), nullptr, 0, &returned, nullptr, nullptr) == 0)
+        _keepAliveOn.fetch_add(1, std::memory_order_relaxed);
+#else
+    const int on = 1;
+    const int idleSec = static_cast<int>((_keepAliveIdleMs + 999) / 1000);
+    const int gapSec = static_cast<int>((_keepAliveIntervalMs + 999) / 1000);
+    if (::setsockopt(socket, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on)) == 0
+        && ::setsockopt(socket, IPPROTO_TCP, TCP_KEEPIDLE, &idleSec, sizeof(idleSec)) == 0
+        && ::setsockopt(socket, IPPROTO_TCP, TCP_KEEPINTVL, &gapSec, sizeof(gapSec)) == 0)
+        _keepAliveOn.fetch_add(1, std::memory_order_relaxed);
+#endif
+}
+
 int64_t CIOCPServer::ProcessAccept(SOCKET clientSocket, int tag, const SOCKADDR_IN& peer, bool outbound)
 {
     // 과부하 차단 — 게임 스레드가 유입을 못 따라가면 새 접속을 받지 않는다.
@@ -732,6 +879,10 @@ int64_t CIOCPServer::ProcessAccept(SOCKET clientSocket, int tag, const SOCKADDR_
 
     // SessionID 생성 [16bit Index][48bit UniqueID]
     int64_t sessionId = CSession::MakeSessionId(index, uniqueId);
+
+    // 살아 있음 확인(SetKeepAlive) — 세션 자리를 받은 접속에만(거절한 접속은 안 센다)
+    if (_keepAliveIdleMs > 0 && (!outbound || _keepAliveOutbound))
+        ApplyKeepAlive(clientSocket);
 
     // session 초기화. 사용가능한 상태가 됨
     _sessions[index]->Initialize(clientSocket, sessionId, tag);
