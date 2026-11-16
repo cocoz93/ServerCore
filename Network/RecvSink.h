@@ -29,6 +29,7 @@ enum class DisconnectReason : uint8_t
     IdleTimeout,    // 쉬는 접속 끊기(SetIdleTimeoutSec)
     BadMessage,     // 자르기 부품이 받은 바이트를 틀렸다고 함(규약 위반 · 최대 넘음)
     SendOverflow,   // 보낼 바이트가 보내기 링에 다 안 들어감
+    AfterSend,      // 보낸 뒤 끊기(RequestDisconnectAfterSend) — 넣어 둔 보내기가 다 나간 뒤 끊음
 };
 
 // 접속을 받자마자 닫은 까닭 — 세션을 안 만들어 세션 번호가 없다

@@ -40,6 +40,8 @@ void CSession::Initialize(SOCKET socket, int64_t sessionId, int tag)
     _sessionId = sessionId;
     _tag = tag;
     _disconnectReason.store(DISCONNECT_REASON_UNSET, std::memory_order_relaxed);
+    _closeAfterSend.store(false, std::memory_order_relaxed);
+    _closeAfterSendFired.store(false, std::memory_order_relaxed);
     _disconnecting = FALSE;
     _sendSubmitBusy = FALSE;
     _sendInFlight = 0;
@@ -1005,6 +1007,8 @@ void CIOCPServer::ProcessSend(CSession* session, DWORD bytesTransferred, int slo
         PostSend(session);
     }
 #endif
+
+    TryCloseAfterSend(session);   // 보낸 뒤 끊기를 걸었으면 — 이 완료로 다 빠졌나
 }
 
 #if !USE_LOCKFREE_SENDQ
@@ -1461,6 +1465,67 @@ void CIOCPServer::ReleaseSession(CSession* session)
 bool CIOCPServer::RequestDisconnectSession(int64_t sessionId)
 {
     return RequestDisconnectSession(sessionId, DisconnectReason::LocalRequest);
+}
+
+bool CIOCPServer::RequestDisconnectAfterSend(int64_t sessionId)
+{
+    // Session ABA 검증 (3-step) — RequestDisconnectSession 과 같다
+    auto session = FindSession(sessionId);
+    if (!session)
+        return false;
+    if (!AcquireSession(session))
+        return false;
+    if (session->_sessionId != sessionId)
+    {
+        IOCountDecrement(session);
+        return false;
+    }
+
+    // 표식을 먼저 — 그 뒤에 오는 완료(ProcessSend) · 보내기(EpollSendSession)가 다 빠졌는지 본다
+    session->_closeAfterSend.store(true, std::memory_order_release);
+    TransportKickAfterSend(session, sessionId);
+    IOCountDecrement(session);
+    return true;
+}
+
+bool CIOCPServer::SendDrained(CSession* session)
+{
+#if USE_LOCKFREE_SENDQ
+    // 큐가 비었고 제출 중인 묶음이 없다(완료가 _sendSubmitBusy 를 내린다)
+    return session->_sendQ.IsEmpty() && session->_sendSubmitBusy == FALSE;
+#else
+    // 링의 읽기 위치는 보내기가 끝나야 민다(IOCP · RIO 는 완료 때 · epoll 은 writev 직후) — 비었으면 걸린 보내기도 없다
+    return session->_sendQ.GetDataSize() == 0;
+#endif
+}
+
+void CIOCPServer::TryCloseAfterSend(CSession* session)
+{
+    if (!session->_closeAfterSend.load(std::memory_order_acquire) || session->_disconnecting == TRUE)
+        return;
+    if (!SendDrained(session))
+        return;
+    if (session->_closeAfterSendFired.exchange(true, std::memory_order_acq_rel))
+        return;   // 완료 쪽과 부른 쪽이 같이 「다 빠짐」을 봤다 — 한 번만
+
+    // 이 소켓만 LINGER 를 끈다 — 닫을 때 커널에 남은 것을 마저 보내고 FIN 으로 끝나게(SetSocketOptions 의 {1, 0} 은 RST)
+    //   LINGER 끄기와 shutdown 을 둘 다 한다 — 루프백 실측: 윈도우는 shutdown 뒤면 {1, 0} 으로 닫아도 남은 것이 다 가고 FIN 으로 끝나지만,
+    //   리눅스는 shutdown 뒤에도 {1, 0} 으로 닫으면 커널에 남은 것을 버리고 RST 를 보낸다(받기 버퍼 4,096 상대 · 60,000 바이트 중 4,096 만 닿음)
+    const SOCKET socket = session->_socket;
+    if (socket != INVALID_SOCKET)
+    {
+        LINGER graceful;
+        graceful.l_onoff = 0;
+        graceful.l_linger = 0;
+        setsockopt(socket, SOL_SOCKET, SO_LINGER, reinterpret_cast<char*>(&graceful), sizeof(graceful));
+#ifdef _WIN32
+        shutdown(socket, SD_SEND);
+#else
+        ::shutdown(socket, SHUT_WR);
+#endif
+    }
+    session->MarkDisconnectReason(DisconnectReason::AfterSend);
+    RequestDisconnectSession(session);
 }
 
 bool CIOCPServer::RequestDisconnectSession(int64_t sessionId, DisconnectReason reason)

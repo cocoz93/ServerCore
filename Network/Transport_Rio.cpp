@@ -252,6 +252,26 @@ void CIOCPServer::TransportSendImmediate(CSession* session, int64_t sessionId)
     }
 }
 
+// 보낸 뒤 끊기 — 소켓을 닫는 일(RioCloseSocketOnOwner)이 소유 워커 몫이라 LINGER · shutdown 도 소유 워커에서 한다.
+//   소유 워커 위면 바로, 아니면 FlushSend 명령을 넘긴다(그 처리가 보낸 뒤 TryCloseAfterSend 를 부른다).
+void CIOCPServer::TransportKickAfterSend(CSession* session, int64_t sessionId)
+{
+    const int ownerIdx = RioOwnerIndex(sessionId);
+    if (t_rioWorkerIndex == ownerIdx)
+    {
+        PostSend(session);
+        TryCloseAfterSend(session);
+    }
+    else if (InterlockedExchange(&session->_queuedForSend, TRUE) == FALSE)
+    {
+        RioCmd cmd;
+        cmd.type = RioCmd::Type::FlushSend;
+        cmd.sessionId = sessionId;
+        RioEnqueueCmd(ownerIdx, std::move(cmd));
+    }
+    // 이미 FlushSend 가 큐에 있으면 그 처리가 본다 — 표식은 부른 쪽이 그 전에 세웠다
+}
+
 // 틱 끝 dirty 배치 → 소유 워커별 FlushSend 명령 핸드오프 (묶음을 가진 스레드가 호출)
 void CIOCPServer::TransportFlushDirty(CSendBatch& batch)
 {
@@ -426,6 +446,14 @@ void CIOCPServer::RioHandleCmd(RioWorker& worker, RioCmd& cmd)
             // 누락되지 않게 (기존 SendWorkerThread의 _queuedForSend 주석 로직 그대로).
             InterlockedExchange(&session->_queuedForSend, FALSE);
             PostSend(session);
+
+            // 보낸 뒤 끊기를 걸었고 보낼 것이 없었으면 완료가 안 온다 — 여기서 본다(pin 을 잡고)
+            if (session->_closeAfterSend.load(std::memory_order_acquire) && AcquireSession(session))
+            {
+                if (session->_sessionId == cmd.sessionId)
+                    TryCloseAfterSend(session);
+                IOCountDecrement(session);
+            }
         }
         break;
     }

@@ -112,6 +112,9 @@ public:
     //   끊는 자리마다 한 번 쓰고 마는 칸이라 _tag 옆에 둔다(입출력마다 바뀌는 칸이 아니다)
     static constexpr uint8_t DISCONNECT_REASON_UNSET = 0xFF;
     std::atomic<uint8_t> _disconnectReason{ DISCONNECT_REASON_UNSET };
+    // 보낸 뒤 끊기 — 걸면(RequestDisconnectAfterSend) 보내기가 다 빠지는 자리마다 끊을지 본다. 끊기는 한 번만(Fired)
+    std::atomic<bool> _closeAfterSend{ false };
+    std::atomic<bool> _closeAfterSendFired{ false };
     void MarkDisconnectReason(DisconnectReason reason)
     {
         uint8_t expected = DISCONNECT_REASON_UNSET;
@@ -419,6 +422,14 @@ public:
     // 쓰는 쪽이 끊는다 — 끊긴 까닭은 LocalRequest(다른 까닭이 먼저 적혔으면 그것)
     bool RequestDisconnectSession(int64_t sessionId);
 
+    // 보낸 뒤 끊기 — 이 세션에 이미 넣은 보내기가 다 나간 뒤 끊는다. 아무 스레드나 불러도 된다.
+    //   보내기 링이 비고 걸린 보내기가 0 이 되면 그 소켓만 LINGER 를 끄고 보내기 쪽을 닫은 뒤(shutdown) 끊는다 —
+    //   다른 끊기는 LINGER {1, 0} 이라 강제 끊기(RST)로 아직 못 보낸 것을 버린다(SetSocketOptions).
+    //   끊긴 까닭은 AfterSend. 부른 뒤에 넣은 보내기는 안 갈 수 있다.
+    //   상대가 안 읽어 보내기가 안 빠지면 안 끊긴다 — 시한이 필요하면 쓰는 쪽이 RequestDisconnectSession 을 부른다.
+    // 반환: 세션이 이미 없으면 false
+    bool RequestDisconnectAfterSend(int64_t sessionId);
+
     // [coalescing] 게임 루프가 틱 끝에 1회 호출 — 이번 틱에 enqueue된 세션을 한 번에 flush (게임 스레드 단독)
     void FlushPendingSends();
 
@@ -450,6 +461,10 @@ public:
 private:
     bool RequestDisconnectSession(CSession* session);
     bool RequestDisconnectSession(int64_t sessionId, DisconnectReason reason);   // 세션 번호를 확인한 뒤 까닭을 적고 끊는다
+    // 보낸 뒤 끊기를 건 세션이고 보내기가 다 빠졌으면 끊는다. pin(또는 이 세션의 걸린 입출력 ref)을 쥔 채 부른다
+    void TryCloseAfterSend(CSession* session);
+    static bool SendDrained(CSession* session);   // 보내기 링이 비었고 걸린 보내기가 없다
+    void TransportKickAfterSend(CSession* session, int64_t sessionId);   // 팔별 — 링에 남은 것을 보내게 하고 다 빠졌는지 보게 한다
     void ReleaseSession(CSession* session);
 
 private:

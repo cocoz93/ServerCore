@@ -297,6 +297,8 @@ void CIOCPServer::EpollSendSession(CSession* session)
     //   PostSend(needDisconnect 먼저 → IOCountDecrement 나중)와 같은 순서로 통일한다.
     if (disconnect)
         RequestDisconnectSession(session);
+    else
+        TryCloseAfterSend(session);   // 보낸 뒤 끊기를 걸었으면 — 이 바퀴로 다 빠졌나(남았으면 EPOLLOUT 바퀴가 다시 본다)
 
     IOCountDecrement(session);
 }
@@ -321,6 +323,13 @@ void CIOCPServer::EpollUpdateWriteInterest(CSession* session, bool wantWrite)
 
 // SendFlush::Immediate — 호출 스레드에서 곧바로 내보낸다.
 void CIOCPServer::TransportSendImmediate(CSession* session, int64_t sessionId)
+{
+    (void)sessionId;
+    EpollSendSession(session);
+}
+
+// 보낸 뒤 끊기 — writev 가 바로 끝나는 모델이라 보내기 한 바퀴의 끝(EpollSendSession)이 다 빠졌는지 본다
+void CIOCPServer::TransportKickAfterSend(CSession* session, int64_t sessionId)
 {
     (void)sessionId;
     EpollSendSession(session);

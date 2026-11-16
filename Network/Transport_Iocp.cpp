@@ -176,6 +176,15 @@ void CIOCPServer::TransportSendImmediate(CSession* session, int64_t sessionId)
     PostSend(session);
 }
 
+// 보낸 뒤 끊기 — 링에 남은 것을 바로 제출하고, 이미 다 빠졌으면 여기서 끊는다(남았으면 완료가 ProcessSend 에서 본다).
+//   소켓은 세션을 놓을 때(ReleaseSession)만 닫으므로 pin 을 쥔 이 스레드가 소켓을 만져도 된다.
+void CIOCPServer::TransportKickAfterSend(CSession* session, int64_t sessionId)
+{
+    (void)sessionId;
+    PostSend(session);
+    TryCloseAfterSend(session);
+}
+
 // 틱 끝 dirty 배치 → 송신 (묶음을 가진 스레드가 호출)
 void CIOCPServer::TransportFlushDirty(CSendBatch& batch)
 {
