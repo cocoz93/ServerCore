@@ -374,6 +374,13 @@ public:
     // 반환: 이미 Start 했으면 false
     bool SetRecvSink(std::unique_ptr<CRecvSink> sink);
 
+    // 쉬는 접속 끊기 — 이 초 동안 받은 바이트가 없으면 끊는다(0 = 끄기). Start 전에 부른다. 안 부르면 60초.
+    //   받은 바이트만 시계를 되돌린다(보내기는 안 센다). 1초 단위라 끊기는 때는 설정 초 ~ 설정 초 + 1초(TimingWheel.h Init).
+    //   상한 MAX_IDLE_TIMEOUT_SEC — 휠이 1초마다 슬롯을 하나 잡아 긴 값은 메모리만 먹는다. 더 오래 쉬어도 되는 연결이면 0.
+    // 반환: 0 ~ 상한 밖이거나 이미 Start 했으면 false
+    bool SetIdleTimeoutSec(int sec);
+    static constexpr int MAX_IDLE_TIMEOUT_SEC = 3600;
+
     bool Start();
     void ShutdownServer();
 
@@ -636,9 +643,10 @@ private:
     // 이 큐가 이 길이를 넘으면 신규 accept를 거절한다 (0=끄기). 설정은 기동 전 1회, 이후 읽기 전용.
     int _eventQueueAcceptLimit = 0;
 
-    // 세션 무활동 타임아웃 (타이밍 휠)
-    static constexpr int SESSION_TIMEOUT_SEC = 60;
+    // 세션 무활동 타임아웃 (타이밍 휠) — 0 이면 휠을 안 만든다(_timingWheel == nullptr)
+    static constexpr int DEFAULT_IDLE_TIMEOUT_SEC = 60;
     static constexpr int TIMER_TICK_INTERVAL_MS = 1000;
+    int _idleTimeoutSec = DEFAULT_IDLE_TIMEOUT_SEC;   // SetIdleTimeoutSec 가 정한다 · Start 뒤 불변
     std::unique_ptr<CTimingWheel> _timingWheel;
 
     static void OnSessionTimeout(void* context, int64_t sessionId);

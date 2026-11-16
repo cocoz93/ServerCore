@@ -269,14 +269,22 @@ bool CIOCPServer::Start()
     // 시스템 타이머 해상도를 1ms로 설정 (Sleep, WaitForSingleObject 등 정밀도 향상)
     Platform::SetHighResolutionTimer(true);
 
-    // 타이밍 휠 생성 및 시작
-    _timingWheel = std::make_unique<CTimingWheel>();
-    if (!_timingWheel->Init(_maxClients, SESSION_TIMEOUT_SEC, TIMER_TICK_INTERVAL_MS))
+    // 타이밍 휠 생성 및 시작 — 쉬는 접속 끊기를 껐으면(0) 안 만든다
+    if (_idleTimeoutSec > 0)
     {
-        SLOG_ERROR("[TimingWheel] Init failed");
-        return false;
+        _timingWheel = std::make_unique<CTimingWheel>();
+        if (!_timingWheel->Init(_maxClients, _idleTimeoutSec, TIMER_TICK_INTERVAL_MS))
+        {
+            SLOG_ERROR("[TimingWheel] Init failed");
+            return false;
+        }
+        _timingWheel->Start(OnSessionTimeout, this);
+        SLOG_INFO("[Network] Idle timeout = {}s", _idleTimeoutSec);
     }
-    _timingWheel->Start(OnSessionTimeout, this);
+    else
+    {
+        SLOG_INFO("[Network] Idle timeout = off");
+    }
 
     // 완료 워커·송신 워커 기동 (팔별) — 워커가 읽는 설정은 기동 "전"에 확정된다.
     TransportStartWorkers();
@@ -359,6 +367,22 @@ bool CIOCPServer::SetFramer(std::unique_ptr<CMessageFramer> framer)
         return false;
     }
     _framer = std::move(framer);
+    return true;
+}
+
+bool CIOCPServer::SetIdleTimeoutSec(int sec)
+{
+    if (_running == TRUE)
+    {
+        SLOG_ERROR("SetIdleTimeoutSec: Start 전에 불러야 한다");
+        return false;
+    }
+    if (sec < 0 || sec > MAX_IDLE_TIMEOUT_SEC)
+    {
+        SLOG_ERROR("SetIdleTimeoutSec: {}초 — 0(끄기) ~ {}초", sec, MAX_IDLE_TIMEOUT_SEC);
+        return false;
+    }
+    _idleTimeoutSec = sec;
     return true;
 }
 
@@ -711,8 +735,9 @@ int64_t CIOCPServer::ProcessAccept(SOCKET clientSocket, int tag)
     else
         PushNetworkEvent(NetworkEvent(NetworkEvent::Type::CONNECTED, sessionId, tag));
 
-    // 타이밍 휠에 세션 등록 (타임아웃 카운트 시작)
-    _timingWheel->RequestRegister(CSession::ExtractIndex(sessionId), sessionId);
+    // 타이밍 휠에 세션 등록 (타임아웃 카운트 시작) — 껐으면 휠이 없다
+    if (_timingWheel)
+        _timingWheel->RequestRegister(CSession::ExtractIndex(sessionId), sessionId);
 
     // 첫 Recv 착수 (팔별) — Initialize의 IOCount=1이 이 IO의 ref. AcquireSession 불필요.
     TransportStartFirstRecv(_sessions[index].get(), clientSocket, sessionId);
@@ -729,8 +754,9 @@ void CIOCPServer::ProcessRecv(CSession* session, DWORD bytesTransferred)
     // 수신 바이트 지표 기록
     _monitor._recvBytes.Add(static_cast<LONG64>(bytesTransferred));
 
-    // 타이밍 휠 수명 갱신 (데이터 수신 = 세션 활성 상태)
-    _timingWheel->RequestRefresh(CSession::ExtractIndex(session->_sessionId), session->_sessionId);
+    // 타이밍 휠 수명 갱신 (데이터 수신 = 세션 활성 상태) — 껐으면 휠이 없다
+    if (_timingWheel)
+        _timingWheel->RequestRefresh(CSession::ExtractIndex(session->_sessionId), session->_sessionId);
 
     // 링버퍼 쓰기 포인터 이동
     // [불변식] PostRecv 게시량 = 게시 시점 freeSize이고, recv 1-pending이라 완료까지 freeSize가
@@ -1335,8 +1361,9 @@ void CIOCPServer::ReleaseSession(CSession* session)
             PushNetworkEvent(NetworkEvent(NetworkEvent::Type::DISCONNECTED, sessionId, tag));
     }
 
-    // 타이밍 휠에서 세션 제거 (이중 만료 방지)
-    _timingWheel->RequestUnregister(CSession::ExtractIndex(sessionId), sessionId);
+    // 타이밍 휠에서 세션 제거 (이중 만료 방지) — 껐으면 휠이 없다
+    if (_timingWheel)
+        _timingWheel->RequestUnregister(CSession::ExtractIndex(sessionId), sessionId);
 
     // Disconnect 시 SendQ 잔여 바이트를 discard 카운터에 적산 (체류량 보정)
     // IOCount==0 단일 스레드 호출이므로 SendQ 경합 없음
