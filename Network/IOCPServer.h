@@ -25,13 +25,13 @@
 #include "SerialBuffer.h"
 #include "NetHeader.h"   // 와이어 헤더만 — 게임 패킷 정의(Protocol.h)는 보지 않는다
 #include "MessageFramer.h"   // 받은 바이트를 메시지로 자르는 부품 (ParsePackets 가 부른다)
+#include "RecvSink.h"        // 받은 것 넘길 곳 — 접속 · 받음 · 끊김 알림 (없으면 이벤트 큐)
 #include "LockFreeConfig.h"      // 락프리 스택/큐 (형제 저장소 MyGit\LockFree 참조)
 #if USE_RIO_TRANSPORT
 #include "RioApi.h"      // RIO 함수 테이블 + 등록 슬랩 (전송 교체 경로 전용)
 #endif
 #include "TimingWheel.h"
 #include "MonitorManager.h"
-#include "Common.h"
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -340,7 +340,8 @@ class CSendBatch
 class CIOCPServer
 {
 public:
-    explicit CIOCPServer(int port, int maxClients, ServerMode mode,
+    // serverName = 기동 로그에 싣는 이름 — 쓰는 쪽이 정한다(이 라이브러리는 서버 종류를 모른다)
+    explicit CIOCPServer(int port, int maxClients, const char* serverName,
                         CMonitorManager& monitor, int workerThreads = 0, int sendWorkers = 0,
                         int rioWorkers = 0, int completionBatch = 0, int sendDepth = 1);
     virtual ~CIOCPServer();
@@ -367,6 +368,11 @@ public:
     //   부품의 최대(MaxMessageSize)를 담을 버퍼가 없으면 Start 가 false 를 돌린다.
     // 반환: nullptr 이거나 이미 Start 했으면 false
     bool SetFramer(std::unique_ptr<CMessageFramer> framer);
+
+    // 받은 것 넘길 곳을 고른다. Start 전에 부른다. 안 부르거나 nullptr 이면 이벤트 큐(PopNetworkEvent · SetSessionRecvQueue).
+    //   주면 접속 · 받음 · 끊김을 그 일이 난 스레드에서 바로 부른다 — 이벤트 큐에는 아무것도 안 들어간다 · 세션별 큐(SetSessionRecvQueue)를 정해도 안 쓴다(RecvSink.h).
+    // 반환: 이미 Start 했으면 false
+    bool SetRecvSink(std::unique_ptr<CRecvSink> sink);
 
     bool Start();
     void ShutdownServer();
@@ -418,17 +424,12 @@ public:
     // 이벤트 큐 과부하 시 신규 accept를 거절할 임계 (0=끄기). Start 전에 설정할 것.
     void SetEventQueueAcceptLimit(int limit) { _eventQueueAcceptLimit = (limit > 0) ? limit : 0; }
 
-    // 서버 모드 가져오기
-    ServerMode GetServerMode() const;
-
     // 내부에서 사용할 함수
 private:
     bool RequestDisconnectSession(CSession* session);
     void ReleaseSession(CSession* session);
 
 private:
-
-    void EchoTestSend(CSession* session, CSerialBuffer* pMsg);
 
     // 게임 로직으로 이벤트 전달 (QUEUE_BASED 모드용)
     void PushNetworkEvent(NetworkEvent&& event);
@@ -499,7 +500,7 @@ private:
     bool  TransportPostListen();                           // 리슨 소켓 "후" 준비 (RIO: 테이블·슬랩·CQ)
     uint32_t TransportListenFlags() const;                 // 소켓 생성 플래그 (RIO: REGISTERED_IO 추가)
     void  TransportStartWorkers();                         // 완료 워커·송신 워커 기동
-    void  TransportLogStarted(const char* modeName) const; // 기동 로그 (스모크가 이 문구로 팔 판정)
+    void  TransportLogStarted(const char* serverName) const; // 기동 로그 (스모크가 이 문구로 팔 판정)
     void  TransportStopBeforeDrain();                      // IOCount 드레인 "전" 정지 (IOCP: 송신 워커)
     void  TransportStopAfterDrain();                       // IOCount 드레인 "후" 정지 (워커 join·자원 해제)
     bool  TransportAttachSession(CSession* session, Platform::NetSocket clientSocket);   // 완료 통지 연결 (IOCP: BindIOCP)
@@ -519,8 +520,9 @@ private:
 private:
     int _port;
     int _maxClients;
-    ServerMode _serverMode;
+    std::string _serverName;                   // 기동 로그 이름 — 쓰는 쪽이 생성자로 준다
     std::unique_ptr<CMessageFramer> _framer;   // 받은 바이트 자르기 — 생성자가 기본을 넣고 SetFramer 가 바꾼다 · Start 뒤 불변
+    std::unique_ptr<CRecvSink> _recvSink;      // 받은 것 넘길 곳 — 없으면 이벤트 큐 · SetRecvSink 가 정한다 · Start 뒤 불변
     int _configuredWorkers;   // INI 지정 워커 수 (0=affinity 코어 수로 자동 산정)
     int _configuredSendWorkers;   // INI 지정 송신 워커 수 (0/1=단일)
     int _configuredRioWorkers;    // INI 지정 RIO 워커 수 (0=자동 2, RIO 빌드 전용)

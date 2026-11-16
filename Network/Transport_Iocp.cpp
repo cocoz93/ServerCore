@@ -102,10 +102,10 @@ void CIOCPServer::TransportStartWorkers()
 }
 
 // 기동 완료 로그 — 스모크가 이 문구로 팔(arm)을 판정한다 (변경 시 RIO\echo-smoke.ps1 동반 수정).
-void CIOCPServer::TransportLogStarted(const char* modeName) const
+void CIOCPServer::TransportLogStarted(const char* serverName) const
 {
     SLOG_INFO("[Network] Server started — worker threads={}, IOCP concurrency={} (affinity cores={}, Mode: {})",
-              _workerThreadCount, _coreCount, _coreCount, modeName);
+              _workerThreadCount, _coreCount, _coreCount, serverName);
 }
 
 // IOCount 드레인 "전" 정지 — 송신 워커를 먼저 멈춰야 PostSend가 pin한 IOCount가 풀린다.

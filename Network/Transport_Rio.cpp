@@ -149,12 +149,12 @@ void CIOCPServer::TransportStartWorkers()
 }
 
 // 기동 완료 로그 — 스모크가 "RIO workers=" 문구로 팔(arm)을 판정한다 (변경 시 echo-smoke.ps1 동반 수정).
-void CIOCPServer::TransportLogStarted(const char* modeName) const
+void CIOCPServer::TransportLogStarted(const char* serverName) const
 {
     SLOG_INFO("[Network] Server started — RIO workers={}, slab={}MB, cq={}/worker (Mode: {})",
               _rioWorkerCount,
               ((RIO_RECV_RING_SIZE + RIO_SEND_RING_SIZE) * static_cast<size_t>(_maxClients)) >> 20,
-              static_cast<DWORD>(_maxClients) * static_cast<DWORD>(1 + _sendDepth) + 16, modeName);
+              static_cast<DWORD>(_maxClients) * static_cast<DWORD>(1 + _sendDepth) + 16, serverName);
 }
 
 void CIOCPServer::TransportStopBeforeDrain()

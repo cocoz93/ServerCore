@@ -102,10 +102,10 @@ void CIOCPServer::TransportStartWorkers()
 }
 
 // 기동 완료 로그 — 스모크가 이 문구로 팔(arm)을 판정한다.
-void CIOCPServer::TransportLogStarted(const char* modeName) const
+void CIOCPServer::TransportLogStarted(const char* serverName) const
 {
     SLOG_INFO("[Network] Server started — epoll workers={} (affinity cores={}, Mode: {})",
-              _workerThreadCount, _coreCount, modeName);
+              _workerThreadCount, _coreCount, serverName);
 }
 
 // IOCount 드레인 "전" 정지 — 4-G에서 송신 워커가 생기면 여기서 멈춘다.

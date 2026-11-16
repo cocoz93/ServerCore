@@ -99,12 +99,12 @@ void CSession::Close()
 
 // CIOCPServer Implementation
 
-CIOCPServer::CIOCPServer(int port, int maxClients, ServerMode mode,
+CIOCPServer::CIOCPServer(int port, int maxClients, const char* serverName,
                          CMonitorManager& monitor, int workerThreads, int sendWorkers, int rioWorkers,
                          int completionBatch, int sendDepth)
     : _port(port)
     , _maxClients(maxClients)
-    , _serverMode(mode)
+    , _serverName(serverName != nullptr ? serverName : "")
     , _configuredWorkers(workerThreads)
     , _configuredSendWorkers(sendWorkers)
     , _configuredRioWorkers(rioWorkers)
@@ -120,11 +120,8 @@ CIOCPServer::CIOCPServer(int port, int maxClients, ServerMode mode,
 {
     // 멤버 변수만 초기화
 
-    // 받은 바이트 자르기 기본값 — GameCodi 에코 더미는 몸 길이 머리(2바이트), 그 밖은 전체 길이 머리(4바이트)
-    if (_serverMode == ServerMode::GameCodiEchoTest)
-        _framer = std::make_unique<CBodyLengthFramer>();
-    else
-        _framer = std::make_unique<CTotalLengthFramer>();
+    // 받은 바이트 자르기 기본값 — 전체 길이 머리(4바이트). 다른 규약은 쓰는 쪽이 SetFramer 로 바꾼다
+    _framer = std::make_unique<CTotalLengthFramer>();
 }
 
 CIOCPServer::~CIOCPServer()
@@ -289,14 +286,7 @@ bool CIOCPServer::Start()
     for (ExtraListener& listener : _extraListeners)
         listener.thread = std::thread(&CIOCPServer::AcceptThread, this, listener.socket, listener.tag);
 
-    const char* modeName = "Unknown";
-    switch (_serverMode)
-    {
-    case ServerMode::GameCodiEchoTest:    modeName = "GameCodiEchoTest";    break;
-    case ServerMode::NetWorkLib_EchoTest: modeName = "NetWorkLib_EchoTest"; break;
-    case ServerMode::GameServer:          modeName = "GameServer";          break;
-    }
-    TransportLogStarted(modeName);
+    TransportLogStarted(_serverName.c_str());
     return true;
 }
 
@@ -369,6 +359,17 @@ bool CIOCPServer::SetFramer(std::unique_ptr<CMessageFramer> framer)
         return false;
     }
     _framer = std::move(framer);
+    return true;
+}
+
+bool CIOCPServer::SetRecvSink(std::unique_ptr<CRecvSink> sink)
+{
+    if (_running == TRUE)
+    {
+        SLOG_ERROR("SetRecvSink: Start 전에 불러야 한다");
+        return false;
+    }
+    _recvSink = std::move(sink);   // nullptr 이면 이벤트 큐 길로 되돌린다
     return true;
 }
 
@@ -704,17 +705,11 @@ int64_t CIOCPServer::ProcessAccept(SOCKET clientSocket, int tag)
         return 0;
     }
 
-    // 컨텐츠쪽 전달
-    switch (_serverMode)
-    {
-    case ServerMode::GameCodiEchoTest:
-    case ServerMode::NetWorkLib_EchoTest:
-        // 에코 모드: 컨텐츠 레이어 없음
-        break;
-    case ServerMode::GameServer:
+    // 컨텐츠쪽 전달 — 받은 것 넘길 곳이 있으면 이 스레드에서 바로, 없으면 이벤트 큐로
+    if (_recvSink)
+        _recvSink->OnConnected(SinkConnected{ sessionId, tag });
+    else
         PushNetworkEvent(NetworkEvent(NetworkEvent::Type::CONNECTED, sessionId, tag));
-        break;
-    }
 
     // 타이밍 휠에 세션 등록 (타임아웃 카운트 시작)
     _timingWheel->RequestRegister(CSession::ExtractIndex(sessionId), sessionId);
@@ -828,24 +823,17 @@ void CIOCPServer::ParsePackets(CSession* session)
         // Seal하면 operator>>/GetData가 차단되어 역직렬화 불가
         // 소유권 1은 Alloc()/Clear()에서 이미 확보됨(RefCount=1) → 여기서 AddRef 불필요
 
-        // 6. 컨텐츠쪽 전달 또는 처리
-        switch (_serverMode)
+        // 6. 컨텐츠쪽 전달 — 받은 것 넘길 곳이 있으면 이 워커에서 바로(ref 1 을 넘긴다),
+        //    없으면 이벤트 큐로(세션별 큐가 정해져 있으면 그리)
+        if (_recvSink)
         {
-        case ServerMode::GameCodiEchoTest:
-        case ServerMode::NetWorkLib_EchoTest:
-            EchoTestSend(session, pMsg);
-            break;
-        case ServerMode::GameServer:
+            _recvSink->OnReceived(SinkReceived{ session->_sessionId, session->_tag, pMsg });
+        }
+        else
         {
             ThreadSafeQueue<NetworkEvent>* target = session->_recvEventQueue.load(std::memory_order_acquire);
             PushNetworkEvent(NetworkEvent(NetworkEvent::Type::RECEIVED,
                 session->_sessionId, pMsg, session->_tag), target ? *target : _eventQueue);
-            break;
-        }
-        default:
-            // 알 수 없는 모드 — 어느 경로로도 소비되지 않으므로 소유권 회수 (누수 방어)
-            pMsg->SubRef();
-            break;
         }
 
     }
@@ -1082,18 +1070,6 @@ void CIOCPServer::PostSend(CSession* session)
 }
 #endif // !USE_LOCKFREE_SENDQ
 
-void CIOCPServer::EchoTestSend(CSession* session, CSerialBuffer* pMsg)
-{
-    // 에코 테스트: 받은 패킷을 그대로 돌려보냄
-    // 송신 메트릭은 호출자(여기)가 집계 (RequestSendMsg는 enqueue 성공 여부만 반환)
-    const int dataSize = pMsg->GetDataSize();
-    if (RequestSendMsg(session->_sessionId, pMsg))
-    {
-        _monitor._sendPackets.Inc();
-        _monitor._sendEnqueuedBytes.Add(static_cast<LONG64>(dataSize));
-    }
-}
-
 // 게임 로직 레이어가 사용할 송신 인터페이스 (콘텐츠가 조립한 CSerialBuffer를 그대로 전달)
 //
 // 소유권 계약: 호출자는 RefCount >= 1인 pMsg를 넘긴다. 이 함수는 해당 1개 ref를 소비한다.
@@ -1268,11 +1244,6 @@ bool CIOCPServer::PopNetworkEvent(NetworkEvent& event)
     return _eventQueue.TryPop(event);
 }
 
-ServerMode CIOCPServer::GetServerMode() const
-{
-    return _serverMode;
-}
-
 // 순수 종료 유도 — releaseFlag 설정 + pending IO 완료 유도로 IOCount 0 수렴을 이끈다.
 //   IOCP: CancelIoEx가 pending을 에러 완료시킨다.
 //   RIO : CancelIoEx가 없다 — 소유 워커의 closesocket이 그 역할 (Phase 0 스모크 실측).
@@ -1358,14 +1329,10 @@ void CIOCPServer::ReleaseSession(CSession* session)
     // 서버 종료 중(_running==false)에는 알림 생략.
     if (sessionId != 0 && _running == TRUE)
     {
-        switch (_serverMode)
-        {
-        case ServerMode::GameServer:
+        if (_recvSink)
+            _recvSink->OnDisconnected(SinkDisconnected{ sessionId, tag });
+        else
             PushNetworkEvent(NetworkEvent(NetworkEvent::Type::DISCONNECTED, sessionId, tag));
-            break;
-        default:
-            break;
-        }
     }
 
     // 타이밍 휠에서 세션 제거 (이중 만료 방지)
