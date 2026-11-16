@@ -2,7 +2,7 @@
 
 // ==========================================================================
 // RioApi — Windows Registered I/O(RIO) 함수 테이블 로더 + 등록 슬랩 RAII
-// (USE_RIO_TRANSPORT 경로 전용 — IOCP 경로에서는 include되지 않는다)
+// (TCP 는 USE_RIO_TRANSPORT 경로에서만 include — UDP 부품(UdpEndpoint_Win.cpp)은 빌드와 상관없이 RIO 팔을 고르면 쓴다)
 //
 //  - CRioApi : WSAIoctl로 RIO 확장 함수 테이블을 프로세스 1회 획득.
 //              이후 CRioApi::Rio().RIOSend(...) 형태로 호출한다.

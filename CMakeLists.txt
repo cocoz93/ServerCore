@@ -109,16 +109,19 @@ endif()
 # ═════════════════════════════════════════════════════════════
 add_library(ServerNetworkLib STATIC
     ${CORE_NET}/IOCPServer.cpp
+    ${CORE_NET}/UdpEndpoint.cpp          # UDP 부품 — 설정 확인 · 통계 · 팔로 넘기기
 )
 
 if(WIN32)
     target_sources(ServerNetworkLib PRIVATE
         ${CORE_NET}/Transport_Iocp.cpp   # 완료포트 팔 (RIO 빌드에서는 빈 번역단위)
         ${CORE_NET}/Transport_Rio.cpp    # RIO 팔 (IOCP 빌드에서는 빈 번역단위)
+        ${CORE_NET}/UdpEndpoint_Win.cpp  # UDP 부품 Windows 팔 둘(보통 · RIO — 빌드가 아니라 실행 때 고름)
     )
 else()
     target_sources(ServerNetworkLib PRIVATE
         ${CORE_NET}/Transport_Epoll.cpp
+        ${CORE_NET}/UdpEndpoint_Linux.cpp   # UDP 부품 리눅스 팔(recvmmsg · sendmmsg · epoll)
     )
 endif()
 
