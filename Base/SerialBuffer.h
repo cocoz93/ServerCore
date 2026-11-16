@@ -13,14 +13,26 @@
 static constexpr int MSG_DEFAULT_SIZE = 1460;
 static constexpr int HEADER_SIZE = 2;
 
+// 큰 직렬화 버퍼 크기 — 기본 버퍼에 안 들어가는 받은 메시지를 담는 두 번째 크기
+//   4,096 = 줄 단위 자르기의 한 줄 최대(Network/MessageFramer.h CLineFramer::MAX_LINE) · 앞 HEADER_SIZE 는 머리 자리
+static constexpr int MSG_LARGE_SIZE = 4096 + HEADER_SIZE;
+
+class CLargeSerialBuffer;
+
 
 class CSerialBuffer
 {
 public:
 	static LockFree::CExternalTlsFreeList<CSerialBuffer>* _TlsMsgFreeList;
+	static LockFree::CExternalTlsFreeList<CLargeSerialBuffer>* _TlsLargeMsgFreeList;   // 큰 버퍼(MSG_LARGE_SIZE) 풀
 
 public:
 	static CSerialBuffer* Alloc();
+	// 큰 버퍼(MSG_LARGE_SIZE) — 기본 버퍼에 안 들어가는 메시지만. 돌려주는 법은 같다(SubRef — 크기로 제 풀을 찾는다)
+	static CSerialBuffer* AllocLarge();
+	// 큰 풀에서 낸 수 · 돌려받은 수(누계). 드문 경로라 원자 더하기 하나씩만 둔다 — 기본 풀은 뜨거운 경로라 세지 않는다
+	static int64_t GetLargeAllocCount();
+	static int64_t GetLargeFreeCount();
 	void AddRef();
 	void AddRef(int64_t count);   // 배치 AddRef — 브로드캐스트 타겟 수만큼 1회 (원자연산 N→1)
 	void SubRef();
@@ -136,4 +148,11 @@ private:
 	// 여러 워커스레드에서 동시 Interlocked 접근 → 별도 캐시라인으로 격리하여 false sharing 방지
 public:
 	alignas(64) std::atomic<int64_t> _RefCount;
+};
+
+// 큰 버퍼 — 크기만 다르다. 풀(CExternalTlsFreeList)이 슬롯을 기본 생성자로 한 번 만들어 두므로 크기를 타입에 싣는다
+class CLargeSerialBuffer final : public CSerialBuffer
+{
+public:
+	CLargeSerialBuffer() : CSerialBuffer(MSG_LARGE_SIZE) {}
 };

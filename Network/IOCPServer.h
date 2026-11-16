@@ -24,6 +24,7 @@
 #include <RingBuffer.h>
 #include "SerialBuffer.h"
 #include "NetHeader.h"   // 와이어 헤더만 — 게임 패킷 정의(Protocol.h)는 보지 않는다
+#include "MessageFramer.h"   // 받은 바이트를 메시지로 자르는 부품 (ParsePackets 가 부른다)
 #include "LockFreeConfig.h"      // 락프리 스택/큐 (형제 저장소 MyGit\LockFree 참조)
 #if USE_RIO_TRANSPORT
 #include "RioApi.h"      // RIO 함수 테이블 + 등록 슬랩 (전송 교체 경로 전용)
@@ -39,6 +40,8 @@
 //   GetWriteBufferPtr()이 _Buff+2를 돌려준다 → 가용은 1458B.
 //   여기에 1460을 두면 ParsePackets의 Dequeue가 할당 밖 2B를 침범한다.
 constexpr size_t MAX_PACKET_SIZE = MSG_DEFAULT_SIZE - HEADER_SIZE;  // 1458B
+// 큰 버퍼 하나에 담기는 최대 — 받은 메시지가 MAX_PACKET_SIZE 를 넘으면 큰 풀에 담는다. 자르기 부품 최대의 상한
+constexpr size_t MAX_LARGE_PACKET_SIZE = MSG_LARGE_SIZE - HEADER_SIZE;  // 4096B
 constexpr size_t MIN_PACKET_SIZE = sizeof(EchoMsgHeader);  // 최소 패킷 크기 (가장 작은 헤더 기준)
 
 // I/O 작업 종류
@@ -359,6 +362,12 @@ public:
     //   표를 코어 안에서 몰래 키우지 않는 까닭: 호출자가 같은 세션 색인으로 자기 표를 만들기 때문이다.
     void SetUntaggedSessionLimit(int limit) { _untaggedSessionLimit = (limit > 0) ? limit : 0; }
 
+    // 받은 바이트를 메시지로 자르는 부품을 고른다. Start 전에 부른다. 안 부르면 전체 길이 머리(CTotalLengthFramer).
+    //   부품은 상태가 없어 모든 세션 · 워커가 하나를 같이 쓴다(MessageFramer.h).
+    //   부품의 최대(MaxMessageSize)를 담을 버퍼가 없으면 Start 가 false 를 돌린다.
+    // 반환: nullptr 이거나 이미 Start 했으면 false
+    bool SetFramer(std::unique_ptr<CMessageFramer> framer);
+
     bool Start();
     void ShutdownServer();
 
@@ -511,6 +520,7 @@ private:
     int _port;
     int _maxClients;
     ServerMode _serverMode;
+    std::unique_ptr<CMessageFramer> _framer;   // 받은 바이트 자르기 — 생성자가 기본을 넣고 SetFramer 가 바꾼다 · Start 뒤 불변
     int _configuredWorkers;   // INI 지정 워커 수 (0=affinity 코어 수로 자동 산정)
     int _configuredSendWorkers;   // INI 지정 송신 워커 수 (0/1=단일)
     int _configuredRioWorkers;    // INI 지정 RIO 워커 수 (0=자동 2, RIO 빌드 전용)

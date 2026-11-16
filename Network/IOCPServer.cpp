@@ -119,6 +119,12 @@ CIOCPServer::CIOCPServer(int port, int maxClients, ServerMode mode,
 #endif
 {
     // 멤버 변수만 초기화
+
+    // 받은 바이트 자르기 기본값 — GameCodi 에코 더미는 몸 길이 머리(2바이트), 그 밖은 전체 길이 머리(4바이트)
+    if (_serverMode == ServerMode::GameCodiEchoTest)
+        _framer = std::make_unique<CBodyLengthFramer>();
+    else
+        _framer = std::make_unique<CTotalLengthFramer>();
 }
 
 CIOCPServer::~CIOCPServer()
@@ -134,6 +140,15 @@ bool CIOCPServer::Start()
         LOG_ERROR_STREAM("[Error] maxClients(" << _maxClients << ") out of range. valid: 1~" << CSession::SESSION_MAX_COUNT);
         return false;
     }
+
+    // 자르기 부품의 최대를 담을 수 있나 — 받은 메시지는 CSerialBuffer 하나에 담는다(ParsePackets).
+    //   기본 버퍼(MAX_PACKET_SIZE)를 넘는 메시지는 큰 버퍼에 담으니 상한은 큰 버퍼다
+    if (_framer->MaxMessageSize() > MAX_LARGE_PACKET_SIZE)
+    {
+        SLOG_ERROR("[Error] Framer {} max {} > buffer {}", _framer->Name(), _framer->MaxMessageSize(), MAX_LARGE_PACKET_SIZE);
+        return false;
+    }
+    SLOG_INFO("[Network] Framer = {} (max {})", _framer->Name(), _framer->MaxMessageSize());
 
     // 송신 깊이 확정 — 뒤따르는 모든 준비물이 이 값을 읽는다(RIO의 요청 큐 깊이·완료 큐 크기,
     //   워커·완료 처리의 게이트). 그래서 어떤 자원보다 먼저 정하고 이후 불변으로 둔다.
@@ -179,6 +194,16 @@ bool CIOCPServer::Start()
     if (!CSerialBuffer::_TlsMsgFreeList->Init(_maxClients * 2))
     {
         LOG_ERROR_STREAM("Failed to init SerialBuffer FreeList");
+        return false;
+    }
+
+    // 큰 버퍼 풀 — 받은 메시지가 기본 버퍼(MAX_PACKET_SIZE)를 넘을 때만 쓴다(자르기 부품 최대가 그보다 클 때).
+    //   워밍업 0 — 그런 메시지가 안 오면 청크를 하나도 만들지 않는다. 청크 하나가 슬롯 1,024개(윈도) · 1,365개(리눅스) × 4,098B ≈ 4.2 · 5.6MB
+    //   (슬롯 수는 풀이 sizeof 로 정한다 · framer_test 가 찍는 값)라 미리 잡지 않고, 처음 쓰는 워커 스레드가 그때 하나 잡는다.
+    CSerialBuffer::_TlsLargeMsgFreeList = new LockFree::CExternalTlsFreeList<CLargeSerialBuffer>(0);
+    if (!CSerialBuffer::_TlsLargeMsgFreeList->Init())
+    {
+        LOG_ERROR_STREAM("Failed to init large SerialBuffer FreeList");
         return false;
     }
 
@@ -329,6 +354,22 @@ bool CIOCPServer::CreateListenSocket()
 {
     _listenSocket = OpenListenSocket(htonl(INADDR_ANY), _port);
     return _listenSocket != INVALID_SOCKET;
+}
+
+bool CIOCPServer::SetFramer(std::unique_ptr<CMessageFramer> framer)
+{
+    if (_running == TRUE)
+    {
+        SLOG_ERROR("SetFramer: Start 전에 불러야 한다");
+        return false;
+    }
+    if (!framer)
+    {
+        SLOG_ERROR("SetFramer: 부품이 비었다");
+        return false;
+    }
+    _framer = std::move(framer);
+    return true;
 }
 
 bool CIOCPServer::AddListener(const char* ip, int port, int tag)
@@ -713,44 +754,41 @@ void CIOCPServer::ProcessRecv(CSession* session, DWORD bytesTransferred)
 
 
 
-// ParsePackets: 링버퍼에서 완성된 패킷 추출 → CSerialBuffer에 적재
+// ParsePackets: 링버퍼에서 완성된 메시지 추출 → CSerialBuffer에 적재
+//   경계는 자르기 부품(_framer)이 정한다. 링의 바이트를 복사 없이 두 구간으로 보이고,
+//   부품이 알려 준 앞 deliver 바이트를 버퍼에 담은 뒤 링에서 consume 바이트를 지운다.
 void CIOCPServer::ParsePackets(CSession* session)
 {
-    // 특정 더미타입에 맞게 헤더사이즈 조정
-    const size_t headerSize = (_serverMode == ServerMode::GameCodiEchoTest)
-        ? sizeof(EchoMsgHeader)  // 2byte (size만, 페이로드 크기)
-        : sizeof(MsgHeader);     // 4byte (size + type, 전체 크기)
+    CRingBufferST& ring = session->_recvQ;
+    const size_t maxDeliver = _framer->MaxMessageSize();
 
     int64_t parsedPackets = 0;   // [계측 배치] per-packet 원자증가 → 종료 시 1회
     while (true)
     {
-        size_t dataSize = session->_recvQ.GetDataSize();
-
-        // 1. 헤더 크기 체크
-        if (dataSize < headerSize)
+        // 1. 읽을 데이터 두 구간 — 읽기 자리 ~ 링 끝 · 링 처음 ~ (감겼을 때만)
+        const size_t dataSize = ring.GetDataSize();
+        if (dataSize == 0)
         {
-            break; // 데이터 부족
+            break;
+        }
+        const size_t directSize = ring.GetDirectReadSize();
+        const RecvSpan data{ ring.GetReadPtr(), directSize, ring.GetBufferStartPtr(), dataSize - directSize };
+
+        // 2. 메시지 하나의 경계
+        const FrameResult frame = _framer->Next(data);
+        if (frame.status == FrameStatus::NeedMore)
+        {
+            break; // 데이터 부족 - 다음 Recv 대기
         }
 
-        // 2. 헤더에서 size 필드 peek (size는 항상 첫 2byte)
-        // [불변식] 1번이 dataSize >= headerSize(2 또는 4)를 보장했고 요청은 2바이트뿐이다.
-        //   ※ 호출을 assert 안에 넣지 말 것 — packetSize를 채우는 부작용이다.
-        uint16_t packetSize = 0;
-        const size_t peekedSize = session->_recvQ.Peek(&packetSize, sizeof(uint16_t));
-        assert(peekedSize == sizeof(uint16_t));
-        (void)peekedSize;   // 릴리즈(NDEBUG) 미사용 경고 억제
-
-        // 3. 전체 패킷 크기 계산
-        // GameCodiEchoTest: size = 페이로드 크기 → 헤더 크기를 더해야 전체 크기
-        // 그 외: size = 전체 크기 (헤더 포함) → 그대로 사용
-        size_t totalPacketSize = (_serverMode == ServerMode::GameCodiEchoTest)
-            ? static_cast<size_t>(packetSize) + sizeof(EchoMsgHeader)
-            : static_cast<size_t>(packetSize);
-
-        // 4. 패킷 크기 검증
-        if (totalPacketSize < headerSize || totalPacketSize > MAX_PACKET_SIZE)
+        // 3. 규약 위반 — 또는 부품이 약속을 어긴 결과(지울 양이 0 · 쌓인 것보다 큼 · 넘길 양이 지울 양이나 최대보다 큼).
+        //    뒤쪽은 그대로 따르면 버퍼 밖에 쓰거나(넘길 양) 같은 자리를 영영 돈다(지울 양) — 틀림과 같이 끊는다.
+        if (frame.status == FrameStatus::Invalid
+            || frame.consume == 0 || frame.consume > dataSize
+            || frame.deliver > frame.consume || frame.deliver > maxDeliver)
         {
-            LOG_ERROR_STREAM("[Error] Invalid packet size: " << totalPacketSize
+            const size_t reported = (frame.status == FrameStatus::Invalid) ? frame.badSize : frame.deliver;
+            LOG_ERROR_STREAM("[Error] Invalid packet size: " << reported
                 << " - SessionId: " << session->_sessionId);
             _monitor._packetErrors.Inc();
             if (parsedPackets != 0)
@@ -759,30 +797,29 @@ void CIOCPServer::ParsePackets(CSession* session)
             return;
         }
 
-        // 5. 전체 패킷이 수신되었는지 확인
-        if (dataSize < totalPacketSize)
-        {
-            break; // 데이터 부족 - 다음 Recv 대기
-        }
-
-        // 6. CSerialBuffer에 패킷 전체 적재 (헤더 포함)
-        CSerialBuffer* pMsg = CSerialBuffer::Alloc();
-        // [불변식] 5번이 dataSize >= totalPacketSize를 확인했고, 그 뒤 이 링을 소비하는 주체가 없다.
-        //   ※ 호출을 assert 안에 넣지 말 것 — 읽기 위치를 옮기는 부작용이다.
-        const size_t dequeuedSize = session->_recvQ.Dequeue(pMsg->GetWriteBufferPtr(), totalPacketSize);
-        assert(dequeuedSize == totalPacketSize);
-        (void)dequeuedSize;   // 릴리즈(NDEBUG) 미사용 경고 억제
+        // 4. 넘길 앞부분을 CSerialBuffer에 적재 (길이 머리 규약은 머리째 · 줄은 CR LF 뺀 줄)
+        //   기본 버퍼에 안 들어가면 큰 버퍼 — 큰 버퍼는 자르기 부품 최대가 MAX_PACKET_SIZE 를 넘을 때만 나온다
+        CSerialBuffer* pMsg = (frame.deliver > MAX_PACKET_SIZE) ? CSerialBuffer::AllocLarge() : CSerialBuffer::Alloc();
+        data.CopyFront(pMsg->GetWriteBufferPtr(), frame.deliver);
         // [불변식] 적재는 항상 성공한다 — 실패 조건인 IsFull(size)는
         //   _DataSize + size > _BufferSize - HEADER_SIZE 인데, pMsg는 바로 위에서 Alloc한 것이라
-        //   _DataSize=0이고 _BufferSize=MSG_DEFAULT_SIZE(1460) 고정, totalPacketSize는 위 4번
-        //   검증에서 MAX_PACKET_SIZE(=MSG_DEFAULT_SIZE-HEADER_SIZE=1458) 이하가 보장된다
-        //   → 1458 > 1458 이 되어 성립할 수 없다.
-        //   이 세 상수의 관계가 다시 어긋나면(원래 Critical: 할당 밖 2B 침범) 여기서 먼저 터진다.
+        //   _DataSize=0이다. deliver 가 MAX_PACKET_SIZE(=MSG_DEFAULT_SIZE-HEADER_SIZE=1458) 이하면
+        //   _BufferSize=MSG_DEFAULT_SIZE(1460) → 1458 > 1458 이 되어 성립할 수 없고,
+        //   넘으면 _BufferSize=MSG_LARGE_SIZE(4098)인데 deliver 는 위 3번에서 부품 최대 이하,
+        //   부품 최대는 Start가 MAX_LARGE_PACKET_SIZE(4096) 이하로 확인했다 → 4096 > 4096 이 되어 성립할 수 없다.
+        //   이 상수들의 관계가 다시 어긋나면(원래 Critical: 할당 밖 2B 침범) 여기서 먼저 터진다.
         //   ※ 호출을 assert 안에 넣지 말 것 — 쓰기 위치를 실제로 옮기는 부작용이라, 릴리즈에서
         //     식째로 사라지면 _DataSize=0인 빈 버퍼가 상위로 흘러간다.
-        const int movedSize = pMsg->MoveWritePos(static_cast<int>(totalPacketSize));
-        assert(movedSize == static_cast<int>(totalPacketSize));
+        const int movedSize = pMsg->MoveWritePos(static_cast<int>(frame.deliver));
+        assert(movedSize == static_cast<int>(frame.deliver));
         (void)movedSize;   // 릴리즈(NDEBUG) 미사용 경고 억제
+
+        // 5. 링에서 지운다
+        // [불변식] 3번이 consume <= dataSize를 확인했고, 그 뒤 이 링을 소비하는 주체가 없다.
+        //   ※ 호출을 assert 안에 넣지 말 것 — 읽기 위치를 옮기는 부작용이다.
+        const size_t consumedSize = ring.Consume(frame.consume);
+        assert(consumedSize == frame.consume);
+        (void)consumedSize;   // 릴리즈(NDEBUG) 미사용 경고 억제
 
         // 수신 패킷 카운트 (지역 누적, 종료 시 1회 반영)
         ++parsedPackets;
@@ -791,7 +828,7 @@ void CIOCPServer::ParsePackets(CSession* session)
         // Seal하면 operator>>/GetData가 차단되어 역직렬화 불가
         // 소유권 1은 Alloc()/Clear()에서 이미 확보됨(RefCount=1) → 여기서 AddRef 불필요
 
-        // 7. 컨텐츠쪽 전달 또는 처리
+        // 6. 컨텐츠쪽 전달 또는 처리
         switch (_serverMode)
         {
         case ServerMode::GameCodiEchoTest:

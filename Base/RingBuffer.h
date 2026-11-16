@@ -325,6 +325,16 @@ public:
         return ptr;
     }
 
+    // 링 처음 자리 — 읽을 데이터가 링 끝에서 감겼을 때 둘째 구간이 여기서 시작한다
+    //   (첫 구간 = GetReadPtr() 부터 GetDirectReadSize() 바이트 · 둘째 = 여기부터 나머지)
+    char* GetBufferStartPtr()
+    {
+        _lock.lock();
+        char* ptr = _buffer;
+        _lock.unlock();
+        return ptr;
+    }
+
     size_t GetDirectWriteSize() const
     {
         _lock.lock();

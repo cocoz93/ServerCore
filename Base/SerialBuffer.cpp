@@ -8,6 +8,13 @@
 //CFreeList<CSerialBuffer> CSerialBuffer::_MsgFreeList;
 //CLockFree_FreeList<CSerialBuffer>* CSerialBuffer::_MsgFreeList;
 LockFree::CExternalTlsFreeList<CSerialBuffer>* CSerialBuffer::_TlsMsgFreeList;
+LockFree::CExternalTlsFreeList<CLargeSerialBuffer>* CSerialBuffer::_TlsLargeMsgFreeList;
+
+namespace
+{
+	std::atomic<int64_t> g_LargeAllocCount{ 0 };
+	std::atomic<int64_t> g_LargeFreeCount{ 0 };
+}
 
 CSerialBuffer* CSerialBuffer::Alloc()
 {
@@ -31,6 +38,17 @@ CSerialBuffer* CSerialBuffer::Alloc()
 	return msg;
 }
 
+CSerialBuffer* CSerialBuffer::AllocLarge()
+{
+	CSerialBuffer* msg = _TlsLargeMsgFreeList->Alloc();
+	msg->Clear();   // Alloc 과 같다 — RefCount=1
+	g_LargeAllocCount.fetch_add(1, std::memory_order_relaxed);
+	return msg;
+}
+
+int64_t CSerialBuffer::GetLargeAllocCount() { return g_LargeAllocCount.load(std::memory_order_relaxed); }
+int64_t CSerialBuffer::GetLargeFreeCount() { return g_LargeFreeCount.load(std::memory_order_relaxed); }
+
 
 
 void CSerialBuffer::Free(CSerialBuffer* msg)
@@ -45,6 +63,13 @@ void CSerialBuffer::Free(CSerialBuffer* msg)
 	//_MsgFreeList->Free(msg);
 
 	//2. Tls-LockFree-FreeList사용
+	// 큰 버퍼는 큰 풀로 — 남의 풀에 돌려주면 풀이 그 자리에서 프로세스를 멈춘다(ExternalTlsFreeList::Free 의 풀 소유권 검사)
+	if (msg->_BufferSize == MSG_LARGE_SIZE)
+	{
+		g_LargeFreeCount.fetch_add(1, std::memory_order_relaxed);
+		_TlsLargeMsgFreeList->Free(static_cast<CLargeSerialBuffer*>(msg));
+		return;
+	}
 	_TlsMsgFreeList->Free(msg);
 	//________________________________________________________
 

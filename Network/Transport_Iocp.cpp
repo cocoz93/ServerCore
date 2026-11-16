@@ -437,8 +437,9 @@ void CIOCPServer::PostRecv(CSession* session, bool skipAcquire)
         }
     }
 
-    // [불변식] 링이 가득 찰(bufCount==0) 수 없다 — 파싱 후 잔여는 불완전 패킷 조각뿐이라
-    //   MAX_PACKET_SIZE(1458) 미만인데 링 용량은 65535다. 파싱이 disconnect로 끝났다면
+    // [불변식] 링이 가득 찰(bufCount==0) 수 없다 — 파싱 후 잔여는 불완전 메시지 조각뿐이라
+    //   자르기 부품 최대 이하(기본 부품 셋 기준 · Start 가 MAX_LARGE_PACKET_SIZE(4096) 이하로 확인)인데
+    //   링 용량은 65535다. 파싱이 disconnect로 끝났다면
     //   위 AcquireSession이 먼저 실패한다. 이 용량 관계가 어긋나면 여기서 먼저 터진다.
     assert(bufCount > 0);
 
